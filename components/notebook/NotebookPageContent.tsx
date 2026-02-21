@@ -439,7 +439,7 @@ export function NotebookPageContent() {
     if (idleQueueTimerRef.current) clearTimeout(idleQueueTimerRef.current);
     idleQueueTimerRef.current = setTimeout(() => {
       void queueRunsForAreas();
-    }, 12_000);
+    }, 5_000);
 
     return () => {
       if (idleQueueTimerRef.current) {
@@ -622,7 +622,7 @@ export function NotebookPageContent() {
     <div className="flex h-screen flex-col bg-[#fffdf8] text-[#2d2b28]">
       <div className="flex h-14 items-center justify-between border-b border-[#e6dfd2] px-5">
         <div className="flex items-center gap-3">
-          <h1 className="font-serif text-2xl font-semibold">Infinite Notebook</h1>
+          <h1 className="font-serif text-2xl font-semibold">Sketch2Ship</h1>
           <button
             onClick={() => {
               const rect = canvasRef.current?.getBoundingClientRect();

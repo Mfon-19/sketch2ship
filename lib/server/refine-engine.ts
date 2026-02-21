@@ -268,7 +268,7 @@ export async function refineNotebook(content: string): Promise<RefineResponse> {
 
   const ai = new GoogleGenAI({ apiKey });
   const response = await ai.models.generateContent({
-    model: "gemini-3-flash-preview",
+    model: "gemini-3.1-pro-preview",
     contents: `${REFINE_PROMPT}\n\n---\n\nNotes:\n${plainText}`,
     config: {
       responseMimeType: "application/json",

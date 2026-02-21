@@ -10,6 +10,17 @@ import type {
 
 const STORAGE_KEY = "sketch2ship_workspace";
 
+export type ShipJobStatus =
+  | "queued"
+  | "planning"
+  | "scaffolding"
+  | "implementing"
+  | "testing"
+  | "publishing"
+  | "ready"
+  | "failed"
+  | "canceled";
+
 export interface NotebookViewport {
   x: number;
   y: number;
@@ -71,6 +82,12 @@ export interface Project {
   id: string;
   name: string;
   ideaSummary?: string;
+  shipStatus?: ShipJobStatus | "idle";
+  shipJobId?: string;
+  shipUpdatedAt?: string;
+  latestPrototypeUrl?: string;
+  latestPrototypeSummary?: string;
+  latestPullRequestUrl?: string;
   noteId?: string;
   areaId?: string;
   specSections: SpecSection[];

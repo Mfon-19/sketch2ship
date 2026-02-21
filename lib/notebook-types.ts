@@ -1,4 +1,10 @@
-import type { NotebookBlock, NotebookViewport, Project, Workspace } from "@/lib/workspace-store";
+import type {
+  NotebookBlock,
+  NotebookViewport,
+  Project,
+  ShipJobStatus,
+  Workspace,
+} from "@/lib/workspace-store";
 
 export type RunStatus =
   | "queued"
@@ -89,4 +95,41 @@ export interface RunResponse {
 export interface AreaProjectLink {
   areaId: string;
   project: Project;
+}
+
+export interface ShipJobLog {
+  id: string;
+  at: string;
+  level: "info" | "warn" | "error";
+  message: string;
+}
+
+export interface ShipJobRecord {
+  id: string;
+  projectId: string;
+  issueIds: string[];
+  status: ShipJobStatus;
+  createdAt: string;
+  updatedAt: string;
+  startedAt?: string;
+  completedAt?: string;
+  error?: string;
+  branchName?: string;
+  pullRequestUrl?: string;
+  prototypeUrl?: string;
+  summary?: string;
+  logs: ShipJobLog[];
+}
+
+export interface ShipStartResponse {
+  workspaceId: string;
+  job: ShipJobRecord;
+  alreadyActive: boolean;
+  workspace: Workspace;
+}
+
+export interface ShipJobResponse {
+  workspaceId: string;
+  job: ShipJobRecord;
+  workspace: Workspace;
 }

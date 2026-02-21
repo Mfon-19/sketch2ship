@@ -1,15 +1,18 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import Link from "next/link";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { usePathname, useSearchParams } from "next/navigation";
 import {
   Bolt,
   Check,
-  ChevronDown,
   FolderOpen,
   Settings,
   Timer,
 } from "lucide-react";
-import type { Project } from "@/lib/workspace-store";
+import { useWorkspace } from "@/components/providers/WorkspaceProvider";
+import type { ShipJobResponse, ShipJobRecord, ShipStartResponse } from "@/lib/notebook-types";
+import type { Project, ShipJobStatus, Workspace } from "@/lib/workspace-store";
 import { cn } from "@/lib/utils";
 
 interface GitHubSyncSidebarProps {
@@ -17,10 +20,43 @@ interface GitHubSyncSidebarProps {
   className?: string;
 }
 
+interface GitHubStatusResponse {
+  connected: boolean;
+  login?: string;
+  error?: string;
+  source?: "workspace-oauth" | "server-token" | "none";
+  connectUrl?: string;
+}
+
+const ACTIVE_SHIP_STATUSES: ShipJobStatus[] = [
+  "queued",
+  "planning",
+  "scaffolding",
+  "implementing",
+  "testing",
+  "publishing",
+];
+
+const SHIP_STATUS_LABEL: Record<ShipJobStatus | "idle", string> = {
+  idle: "Idle",
+  queued: "Queued",
+  planning: "Planning",
+  scaffolding: "Scaffolding",
+  implementing: "Implementing",
+  testing: "Testing",
+  publishing: "Publishing",
+  ready: "Prototype Ready",
+  failed: "Failed",
+  canceled: "Canceled",
+};
+
 export function GitHubSyncSidebar({
   project,
   className,
 }: GitHubSyncSidebarProps) {
+  const { updateWorkspace } = useWorkspace();
+  const pathname = usePathname();
+  const searchParams = useSearchParams();
   const [selectedIssues, setSelectedIssues] = useState<Set<string>>(
     () =>
       new Set(
@@ -29,8 +65,38 @@ export function GitHubSyncSidebar({
           .map((issue) => issue.id)
       )
   );
+  const [shipJob, setShipJob] = useState<ShipJobRecord | null>(null);
+  const [shipLoading, setShipLoading] = useState(false);
+  const [shipError, setShipError] = useState<string | null>(null);
+  const [repoInput, setRepoInput] = useState(project.repository ?? "");
+  const [repoSaving, setRepoSaving] = useState(false);
+  const [repoMessage, setRepoMessage] = useState<string | null>(null);
+  const [githubStatus, setGitHubStatus] = useState<GitHubStatusResponse | null>(
+    null
+  );
 
   const allSelected = selectedIssues.size === project.generatedIssues.length;
+  const projectShipStatus = project.shipStatus ?? "idle";
+  const hasActiveShip = ACTIVE_SHIP_STATUSES.includes(
+    projectShipStatus as ShipJobStatus
+  );
+
+  const syncWorkspace = useCallback(
+    (next: Workspace) => {
+      updateWorkspace(() => next);
+    },
+    [updateWorkspace]
+  );
+
+  const currentPath = useMemo(() => {
+    const query = searchParams.toString();
+    return query ? `${pathname}?${query}` : pathname;
+  }, [pathname, searchParams]);
+
+  const connectHref = useMemo(() => {
+    const base = githubStatus?.connectUrl ?? "/api/github/connect";
+    return `${base}?redirect=${encodeURIComponent(currentPath)}`;
+  }, [currentPath, githubStatus?.connectUrl]);
 
   const toggleAll = () => {
     if (allSelected) {
@@ -47,6 +113,165 @@ export function GitHubSyncSidebar({
         .sort((a, b) => (a.number ?? 9999) - (b.number ?? 9999)),
     [project.generatedIssues]
   );
+
+  useEffect(() => {
+    setSelectedIssues(
+      new Set(
+        project.generatedIssues
+          .filter((issue) => issue.selected)
+          .map((issue) => issue.id)
+      )
+    );
+  }, [project.generatedIssues, project.id]);
+
+  useEffect(() => {
+    setRepoInput(project.repository ?? "");
+  }, [project.id, project.repository]);
+
+  useEffect(() => {
+    void (async () => {
+      try {
+        const response = await fetch("/api/github/status", {
+          method: "GET",
+          credentials: "include",
+          cache: "no-store",
+        });
+        if (!response.ok) return;
+        const payload = (await response.json()) as GitHubStatusResponse;
+        setGitHubStatus(payload);
+      } catch {
+        setGitHubStatus({ connected: false, error: "Unable to reach GitHub API" });
+      }
+    })();
+  }, []);
+
+  const refreshShipJob = useCallback(
+    async (jobId: string) => {
+      try {
+        const response = await fetch(`/api/ship/jobs/${jobId}`, {
+          method: "GET",
+          credentials: "include",
+          cache: "no-store",
+        });
+        if (!response.ok) return;
+        const payload = (await response.json()) as ShipJobResponse;
+        setShipJob(payload.job);
+        syncWorkspace(payload.workspace);
+      } catch {
+        // suppress poll failures
+      }
+    },
+    [syncWorkspace]
+  );
+
+  useEffect(() => {
+    if (!project.shipJobId) {
+      setShipJob(null);
+      return;
+    }
+    void refreshShipJob(project.shipJobId);
+  }, [project.shipJobId, refreshShipJob]);
+
+  useEffect(() => {
+    if (!project.shipJobId || !hasActiveShip) return;
+    const poll = setInterval(() => {
+      void refreshShipJob(project.shipJobId!);
+    }, 2200);
+    return () => clearInterval(poll);
+  }, [hasActiveShip, project.shipJobId, refreshShipJob]);
+
+  const onShip = async () => {
+    if (githubStatus && !githubStatus.connected) {
+      setShipError(githubStatus.error ?? "GitHub token is not configured.");
+      return;
+    }
+
+    setShipLoading(true);
+    setShipError(null);
+    try {
+      const response = await fetch("/api/ship/start", {
+        method: "POST",
+        credentials: "include",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          projectId: project.id,
+          issueIds: [...selectedIssues],
+        }),
+      });
+      const payload = (await response.json()) as
+        | (ShipStartResponse & { error?: string })
+        | { error?: string };
+      if (!response.ok) {
+        setShipError(payload.error ?? "Unable to start ship job");
+        return;
+      }
+
+      const shipPayload = payload as ShipStartResponse;
+      setShipJob(shipPayload.job);
+      syncWorkspace(shipPayload.workspace);
+    } catch {
+      setShipError("Network error while starting ship job");
+    } finally {
+      setShipLoading(false);
+    }
+  };
+
+  const onDisconnectGitHub = async () => {
+    setRepoMessage(null);
+    try {
+      const response = await fetch("/api/github/disconnect", {
+        method: "POST",
+        credentials: "include",
+      });
+      if (!response.ok) {
+        setRepoMessage("Unable to disconnect GitHub.");
+        return;
+      }
+      setGitHubStatus({
+        connected: false,
+        source: "none",
+        connectUrl: "/api/github/connect",
+      });
+      setRepoMessage("GitHub disconnected for this workspace.");
+    } catch {
+      setRepoMessage("Network error while disconnecting GitHub.");
+    }
+  };
+
+  const onSaveRepository = async () => {
+    setRepoSaving(true);
+    setRepoMessage(null);
+    try {
+      const response = await fetch(`/api/projects/${project.id}/repository`, {
+        method: "POST",
+        credentials: "include",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ repository: repoInput.trim() }),
+      });
+      const payload = (await response.json()) as
+        | { workspace: Workspace; error?: string }
+        | { error?: string };
+      if (!response.ok) {
+        setRepoMessage(payload.error ?? "Failed to save repository");
+        return;
+      }
+      const okPayload = payload as { workspace: Workspace };
+      syncWorkspace(okPayload.workspace);
+      setRepoMessage("Repository saved.");
+    } catch {
+      setRepoMessage("Network error while saving repository.");
+    } finally {
+      setRepoSaving(false);
+    }
+  };
+
+  const buttonLabel = shipLoading
+    ? "Starting Agent..."
+    : hasActiveShip
+      ? "Agent Running..."
+      : projectShipStatus === "ready"
+        ? "Re-Ship with AI Agent"
+        : "Ship with AI Agent";
 
   return (
     <aside
@@ -70,19 +295,64 @@ export function GitHubSyncSidebar({
           </button>
         </div>
 
-        <div className="flex cursor-pointer items-center rounded border border-[#d7d1c8] bg-white p-3 shadow-sm transition hover:border-[#2f2d2a]">
-          <div className="mr-3 flex h-8 w-8 items-center justify-center rounded-full border border-[#dcd6cc] bg-[#efebe3] text-[#3e3a35]">
-            <FolderOpen className="h-4 w-4" />
+        <div className="rounded border border-[#d7d1c8] bg-white p-3 shadow-sm">
+          <div className="mb-2 flex items-center gap-3">
+            <div className="flex h-8 w-8 items-center justify-center rounded-full border border-[#dcd6cc] bg-[#efebe3] text-[#3e3a35]">
+              <FolderOpen className="h-4 w-4" />
+            </div>
+            <div>
+              <p className="text-[10px] font-bold uppercase tracking-[0.12em] text-[#77726a]">
+                Repository
+              </p>
+              <p className="font-mono text-sm font-medium text-[#2f2d2a]">
+                {project.repository ?? (githubStatus?.connected ? "Auto-created on Ship" : "Not connected")}
+              </p>
+            </div>
           </div>
-          <div>
-            <p className="text-[10px] font-bold uppercase tracking-[0.12em] text-[#77726a]">
-              Repository
-            </p>
-            <p className="font-mono text-sm font-medium text-[#2f2d2a]">
-              {project.repository ?? "Select repository"}
-            </p>
+          <div className="flex gap-2">
+            <input
+              value={repoInput}
+              onChange={(event) => setRepoInput(event.target.value)}
+              placeholder="owner/repo"
+              className="h-9 min-w-0 flex-1 rounded border border-[#d8d2c8] bg-white px-2.5 font-mono text-xs text-[#2f2d2a] focus:border-[#2f2d2a] focus:outline-none"
+            />
+            <button
+              onClick={onSaveRepository}
+              disabled={repoSaving || repoInput.trim() === (project.repository ?? "")}
+              className={cn(
+                "h-9 rounded px-3 text-xs font-semibold",
+                repoSaving || repoInput.trim() === (project.repository ?? "")
+                  ? "cursor-not-allowed border border-[#ddd7ca] bg-[#f2eee6] text-[#8b857b]"
+                  : "border border-[#2f2d2a] bg-[#2f2d2a] text-white hover:bg-black"
+              )}
+            >
+              {repoSaving ? "Saving..." : "Save"}
+            </button>
           </div>
-          <ChevronDown className="ml-auto h-4 w-4 text-[#8e8981]" />
+          <p className="mt-2 text-[11px] text-[#6a655d]">
+            {githubStatus?.connected
+              ? `GitHub connected${githubStatus.login ? ` as ${githubStatus.login}` : ""}.`
+              : `GitHub not connected. ${githubStatus?.error ?? "Set GITHUB_TOKEN on the server."}`}
+          </p>
+          <div className="mt-2 flex items-center gap-2">
+            <Link
+              href={connectHref}
+              className="rounded border border-[#d7d1c8] bg-[#f8f5ef] px-2 py-1 text-[11px] font-medium text-[#2f2d2a] hover:bg-[#f1ece3]"
+            >
+              {githubStatus?.connected ? "Reconnect GitHub" : "Connect GitHub"}
+            </Link>
+            {githubStatus?.source === "workspace-oauth" ? (
+              <button
+                onClick={onDisconnectGitHub}
+                className="rounded border border-[#d7d1c8] bg-white px-2 py-1 text-[11px] font-medium text-[#6f695f] hover:bg-[#f7f3eb]"
+              >
+                Disconnect
+              </button>
+            ) : null}
+          </div>
+          {repoMessage ? (
+            <p className="mt-1 text-[11px] text-[#6a655d]">{repoMessage}</p>
+          ) : null}
         </div>
       </div>
 
@@ -181,6 +451,74 @@ export function GitHubSyncSidebar({
             </div>
           </div>
         )}
+
+        <div className="mt-8 rounded border border-[#d7d1c8] bg-white p-4 shadow-sm">
+          <div className="mb-2 flex items-center justify-between">
+            <h4 className="text-xs font-bold uppercase tracking-[0.15em] text-[#2f2d2a]">
+              Agent Run
+            </h4>
+            <span
+              className={cn(
+                "rounded px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.1em]",
+                projectShipStatus === "ready"
+                  ? "bg-emerald-100 text-emerald-700"
+                  : projectShipStatus === "failed"
+                    ? "bg-red-100 text-red-700"
+                    : "bg-[#efebe3] text-[#5f5a53]"
+              )}
+            >
+              {SHIP_STATUS_LABEL[projectShipStatus as ShipJobStatus | "idle"]}
+            </span>
+          </div>
+
+          {shipError ? (
+            <p className="mb-2 text-xs text-red-700">{shipError}</p>
+          ) : null}
+
+          {project.latestPrototypeSummary ? (
+            <p className="mb-3 text-xs leading-5 text-[#5f5a53]">
+              {project.latestPrototypeSummary}
+            </p>
+          ) : (
+            <p className="mb-3 text-xs leading-5 text-[#5f5a53]">
+              Start a background agent run to convert this plan into a working
+              prototype branch and PR.
+            </p>
+          )}
+
+          {shipJob?.logs?.length ? (
+            <div className="mb-3 space-y-1 rounded border border-[#ece7dd] bg-[#faf8f3] p-2">
+              {shipJob.logs.slice(0, 4).map((log) => (
+                <p key={log.id} className="text-[11px] text-[#6b665f]">
+                  {log.message}
+                </p>
+              ))}
+            </div>
+          ) : null}
+
+          <div className="flex flex-col gap-1 text-xs">
+            {project.latestPrototypeUrl ? (
+              <Link
+                href={project.latestPrototypeUrl}
+                target="_blank"
+                rel="noreferrer"
+                className="text-[#2f2d2a] underline underline-offset-2"
+              >
+                Open latest prototype
+              </Link>
+            ) : null}
+            {project.latestPullRequestUrl ? (
+              <Link
+                href={project.latestPullRequestUrl}
+                target="_blank"
+                rel="noreferrer"
+                className="text-[#2f2d2a] underline underline-offset-2"
+              >
+                Open latest pull request
+              </Link>
+            ) : null}
+          </div>
+        </div>
       </div>
 
       <div className="border-t border-[#d8d3ca] bg-[#f2eee6]/60 p-6">
@@ -194,8 +532,17 @@ export function GitHubSyncSidebar({
             {project.eta ?? "~2 mins"}
           </span>
         </div>
-        <button className="flex h-12 w-full items-center justify-center gap-2 rounded bg-[#2f2d2a] text-sm font-bold tracking-wide text-white transition hover:bg-black">
-          Ship with AI Agent
+        <button
+          onClick={onShip}
+          disabled={shipLoading || hasActiveShip}
+          className={cn(
+            "flex h-12 w-full items-center justify-center gap-2 rounded text-sm font-bold tracking-wide text-white transition",
+            shipLoading || hasActiveShip
+              ? "cursor-not-allowed bg-[#4d4a45]"
+              : "bg-[#2f2d2a] hover:bg-black"
+          )}
+        >
+          {buttonLabel}
           <Bolt className="h-4 w-4" />
         </button>
         <p className="mt-3 text-center text-[10px] italic text-[#6d6860]">

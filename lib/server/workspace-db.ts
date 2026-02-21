@@ -7,12 +7,14 @@ import type {
   NotePatch,
   RunRecord,
   RunStatus,
+  ShipJobRecord,
 } from "@/lib/notebook-types";
 import type {
   NotebookArea,
   NotebookBlock,
   NotebookEntry,
   Project,
+  ShipJobStatus,
   Workspace,
 } from "@/lib/workspace-store";
 import {
@@ -24,6 +26,19 @@ import {
 interface WorkspaceRecord {
   workspace: Workspace;
   runs: RunRecord[];
+  shipJobs: ShipJobRecord[];
+  githubAuth?: {
+    accessToken: string;
+    tokenType?: string;
+    scope?: string;
+    login?: string;
+    connectedAt: string;
+  };
+  githubOAuthState?: {
+    value: string;
+    redirectTo?: string;
+    expiresAt: string;
+  };
 }
 
 interface DatabaseFile {
@@ -72,6 +87,15 @@ function cloneWorkspaceRecord(record: WorkspaceRecord): WorkspaceRecord {
   return {
     workspace: JSON.parse(JSON.stringify(record.workspace)) as Workspace,
     runs: JSON.parse(JSON.stringify(record.runs)) as RunRecord[],
+    shipJobs: JSON.parse(JSON.stringify(record.shipJobs)) as ShipJobRecord[],
+    githubAuth: record.githubAuth
+      ? (JSON.parse(JSON.stringify(record.githubAuth)) as WorkspaceRecord["githubAuth"])
+      : undefined,
+    githubOAuthState: record.githubOAuthState
+      ? (JSON.parse(
+          JSON.stringify(record.githubOAuthState)
+        ) as WorkspaceRecord["githubOAuthState"])
+      : undefined,
   };
 }
 
@@ -306,6 +330,9 @@ async function ensureWorkspaceRecordInternal(
     db.workspaces[workspaceId] = {
       workspace: createEmptyWorkspace(workspaceId),
       runs: [],
+      shipJobs: [],
+      githubAuth: undefined,
+      githubOAuthState: undefined,
     };
   }
 
@@ -315,6 +342,24 @@ async function ensureWorkspaceRecordInternal(
   db.workspaces[workspaceId].runs = Array.isArray(db.workspaces[workspaceId].runs)
     ? db.workspaces[workspaceId].runs
     : [];
+  db.workspaces[workspaceId].shipJobs = Array.isArray(
+    db.workspaces[workspaceId].shipJobs
+  )
+    ? db.workspaces[workspaceId].shipJobs
+    : [];
+  if (
+    db.workspaces[workspaceId].githubOAuthState &&
+    (!db.workspaces[workspaceId].githubOAuthState.value ||
+      !db.workspaces[workspaceId].githubOAuthState.expiresAt)
+  ) {
+    db.workspaces[workspaceId].githubOAuthState = undefined;
+  }
+  if (
+    db.workspaces[workspaceId].githubAuth &&
+    !db.workspaces[workspaceId].githubAuth.accessToken
+  ) {
+    db.workspaces[workspaceId].githubAuth = undefined;
+  }
 
   return { db, record: db.workspaces[workspaceId] };
 }
@@ -418,6 +463,29 @@ function buildAreaSummaries(
       projectId: latestRun?.projectId ?? linkedProject?.id,
     };
   });
+}
+
+const ACTIVE_SHIP_STATUSES: ShipJobStatus[] = [
+  "queued",
+  "planning",
+  "scaffolding",
+  "implementing",
+  "testing",
+  "publishing",
+];
+
+function isActiveShipStatus(status: ShipJobStatus): boolean {
+  return ACTIVE_SHIP_STATUSES.includes(status);
+}
+
+function touchProjectShipping(
+  project: Project,
+  status: ShipJobStatus,
+  jobId: string
+) {
+  project.shipStatus = status;
+  project.shipJobId = jobId;
+  project.shipUpdatedAt = nowIso();
 }
 
 export async function getWorkspaceRecord(
@@ -599,11 +667,20 @@ export async function finalizeRun(
     if (!run) return null;
 
     const projectId = project.id || crypto.randomUUID();
+    const existingForArea = record.workspace.projects.find(
+      (entry) => entry.noteId === run.noteId && entry.areaId === run.areaId
+    );
     const projectWithMeta: Project = {
       ...project,
       id: projectId,
       noteId: run.noteId,
       areaId: run.areaId,
+      shipStatus: existingForArea?.shipStatus ?? "idle",
+      shipJobId: existingForArea?.shipJobId,
+      shipUpdatedAt: existingForArea?.shipUpdatedAt,
+      latestPrototypeUrl: existingForArea?.latestPrototypeUrl,
+      latestPrototypeSummary: existingForArea?.latestPrototypeSummary,
+      latestPullRequestUrl: existingForArea?.latestPullRequestUrl,
     };
 
     record.workspace.extractedIdeas = ideas;
@@ -666,4 +743,282 @@ export async function getAreaTextForRun(
   if (!note) return null;
   const text = getAreaText(note, run.areaId);
   return { run, text };
+}
+
+export async function setGitHubOAuthState(
+  workspaceId: string,
+  state: string,
+  redirectTo?: string
+): Promise<void> {
+  await withLock(async () => {
+    const { db, record } = await ensureWorkspaceRecordInternal(workspaceId);
+    record.githubOAuthState = {
+      value: state,
+      redirectTo,
+      expiresAt: new Date(Date.now() + 10 * 60 * 1000).toISOString(),
+    };
+    await saveDb(db);
+  });
+}
+
+export async function consumeGitHubOAuthState(
+  workspaceId: string,
+  state: string
+): Promise<{ redirectTo?: string } | null> {
+  return withLock(async () => {
+    const { db, record } = await ensureWorkspaceRecordInternal(workspaceId);
+    const existing = record.githubOAuthState;
+    record.githubOAuthState = undefined;
+    await saveDb(db);
+
+    if (!existing) return null;
+    if (existing.value !== state) return null;
+    if (+new Date(existing.expiresAt) < Date.now()) return null;
+    return { redirectTo: existing.redirectTo };
+  });
+}
+
+export async function saveWorkspaceGitHubAuth(
+  workspaceId: string,
+  auth: {
+    accessToken: string;
+    tokenType?: string;
+    scope?: string;
+    login?: string;
+  }
+) {
+  await withLock(async () => {
+    const { db, record } = await ensureWorkspaceRecordInternal(workspaceId);
+    record.githubAuth = {
+      accessToken: auth.accessToken,
+      tokenType: auth.tokenType,
+      scope: auth.scope,
+      login: auth.login,
+      connectedAt: nowIso(),
+    };
+    await saveDb(db);
+  });
+}
+
+export async function clearWorkspaceGitHubAuth(workspaceId: string): Promise<void> {
+  await withLock(async () => {
+    const { db, record } = await ensureWorkspaceRecordInternal(workspaceId);
+    record.githubAuth = undefined;
+    await saveDb(db);
+  });
+}
+
+export async function getWorkspaceGitHubAuth(workspaceId: string): Promise<{
+  login?: string;
+  scope?: string;
+  tokenType?: string;
+  connectedAt?: string;
+  hasToken: boolean;
+}> {
+  const record = await getWorkspaceRecord(workspaceId);
+  const auth = record.githubAuth;
+  return {
+    login: auth?.login,
+    scope: auth?.scope,
+    tokenType: auth?.tokenType,
+    connectedAt: auth?.connectedAt,
+    hasToken: Boolean(auth?.accessToken),
+  };
+}
+
+export async function getWorkspaceGitHubToken(
+  workspaceId: string
+): Promise<string | null> {
+  const record = await getWorkspaceRecord(workspaceId);
+  const workspaceToken = record.githubAuth?.accessToken?.trim();
+  if (workspaceToken) return workspaceToken;
+  const fallbackToken = process.env.GITHUB_TOKEN?.trim();
+  return fallbackToken || null;
+}
+
+export async function createShipJob(
+  workspaceId: string,
+  projectId: string,
+  issueIds: string[]
+): Promise<{
+  job: ShipJobRecord;
+  alreadyActive: boolean;
+  workspace: Workspace;
+}> {
+  return withLock(async () => {
+    const { db, record } = await ensureWorkspaceRecordInternal(workspaceId);
+    const project = record.workspace.projects.find((entry) => entry.id === projectId);
+    if (!project) {
+      throw new Error("project-not-found");
+    }
+
+    const active = record.shipJobs.find(
+      (job) => job.projectId === projectId && isActiveShipStatus(job.status)
+    );
+    if (active) {
+      return {
+        job: JSON.parse(JSON.stringify(active)) as ShipJobRecord,
+        alreadyActive: true,
+        workspace: JSON.parse(JSON.stringify(record.workspace)) as Workspace,
+      };
+    }
+
+    const normalizedIssueIds =
+      issueIds.length > 0
+        ? issueIds
+        : project.generatedIssues.map((issue) => issue.id).slice(0, 6);
+    const timestamp = nowIso();
+    const job: ShipJobRecord = {
+      id: crypto.randomUUID(),
+      projectId,
+      issueIds: normalizedIssueIds,
+      status: "queued",
+      createdAt: timestamp,
+      updatedAt: timestamp,
+      logs: [
+        {
+          id: crypto.randomUUID(),
+          at: timestamp,
+          level: "info",
+          message: "Ship job queued. Building implementation brief from spec and plan.",
+        },
+      ],
+    };
+
+    record.shipJobs.unshift(job);
+    touchProjectShipping(project, "queued", job.id);
+    touchWorkspace(record.workspace);
+    await saveDb(db);
+
+    return {
+      job: JSON.parse(JSON.stringify(job)) as ShipJobRecord,
+      alreadyActive: false,
+      workspace: JSON.parse(JSON.stringify(record.workspace)) as Workspace,
+    };
+  });
+}
+
+export async function getShipJobById(
+  workspaceId: string,
+  jobId: string
+): Promise<{ job: ShipJobRecord | null; workspace: Workspace }> {
+  const record = await getWorkspaceRecord(workspaceId);
+  return {
+    job: record.shipJobs.find((entry) => entry.id === jobId) ?? null,
+    workspace: record.workspace,
+  };
+}
+
+export async function getShipJobContext(
+  workspaceId: string,
+  jobId: string
+): Promise<{ job: ShipJobRecord; project: Project } | null> {
+  const record = await getWorkspaceRecord(workspaceId);
+  const job = record.shipJobs.find((entry) => entry.id === jobId);
+  if (!job) return null;
+  const project = record.workspace.projects.find((entry) => entry.id === job.projectId);
+  if (!project) return null;
+  return { job, project };
+}
+
+export async function updateShipJob(
+  workspaceId: string,
+  jobId: string,
+  status: ShipJobStatus,
+  extras?: {
+    level?: "info" | "warn" | "error";
+    message?: string;
+    error?: string;
+    branchName?: string;
+    pullRequestUrl?: string;
+    prototypeUrl?: string;
+    summary?: string;
+  }
+): Promise<ShipJobRecord | null> {
+  return withLock(async () => {
+    const { db, record } = await ensureWorkspaceRecordInternal(workspaceId);
+    const job = record.shipJobs.find((entry) => entry.id === jobId);
+    if (!job) return null;
+
+    const project = record.workspace.projects.find(
+      (entry) => entry.id === job.projectId
+    );
+    if (!project) return null;
+
+    const timestamp = nowIso();
+    job.status = status;
+    job.updatedAt = timestamp;
+    if (!job.startedAt && status !== "queued") {
+      job.startedAt = timestamp;
+    }
+    if (status === "ready" || status === "failed" || status === "canceled") {
+      job.completedAt = timestamp;
+    }
+    if (extras?.error) {
+      job.error = extras.error.slice(0, 500);
+    }
+    if (extras?.branchName) {
+      job.branchName = extras.branchName;
+    }
+    if (extras?.pullRequestUrl) {
+      job.pullRequestUrl = extras.pullRequestUrl;
+      project.latestPullRequestUrl = extras.pullRequestUrl;
+    }
+    if (extras?.prototypeUrl) {
+      job.prototypeUrl = extras.prototypeUrl;
+      project.latestPrototypeUrl = extras.prototypeUrl;
+    }
+    if (extras?.summary) {
+      job.summary = extras.summary;
+      project.latestPrototypeSummary = extras.summary;
+    }
+    if (extras?.message) {
+      job.logs.unshift({
+        id: crypto.randomUUID(),
+        at: timestamp,
+        level: extras.level ?? "info",
+        message: extras.message,
+      });
+      job.logs = job.logs.slice(0, 80);
+    }
+
+    touchProjectShipping(project, status, job.id);
+    touchWorkspace(record.workspace);
+    await saveDb(db);
+
+    return JSON.parse(JSON.stringify(job)) as ShipJobRecord;
+  });
+}
+
+export async function failShipJob(
+  workspaceId: string,
+  jobId: string,
+  errorMessage: string
+): Promise<ShipJobRecord | null> {
+  return updateShipJob(workspaceId, jobId, "failed", {
+    level: "error",
+    message: `Ship job failed: ${errorMessage.slice(0, 180)}`,
+    error: errorMessage,
+  });
+}
+
+export async function updateProjectRepository(
+  workspaceId: string,
+  projectId: string,
+  repository: string
+): Promise<{ project: Project; workspace: Workspace } | null> {
+  return withLock(async () => {
+    const { db, record } = await ensureWorkspaceRecordInternal(workspaceId);
+    const project = record.workspace.projects.find((entry) => entry.id === projectId);
+    if (!project) return null;
+
+    project.repository = repository.trim() || undefined;
+    touchWorkspace(record.workspace);
+    await saveDb(db);
+
+    return {
+      project: JSON.parse(JSON.stringify(project)) as Project,
+      workspace: JSON.parse(JSON.stringify(record.workspace)) as Workspace,
+    };
+  });
 }
