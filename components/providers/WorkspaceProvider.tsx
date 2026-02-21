@@ -5,9 +5,14 @@ import {
   useContext,
   useState,
   useCallback,
+  useEffect,
 } from "react";
 import type { Workspace } from "@/lib/workspace-store";
-import { getWorkspace, updateWorkspace as updateStore } from "@/lib/workspace-store";
+import {
+  getWorkspace,
+  saveWorkspace,
+  updateWorkspace as updateStore,
+} from "@/lib/workspace-store";
 
 interface WorkspaceContextValue {
   workspace: Workspace | null;
@@ -21,6 +26,35 @@ export function WorkspaceProvider({ children }: { children: React.ReactNode }) {
   const [workspace, setWorkspace] = useState<Workspace | null>(() =>
     getWorkspace()
   );
+  const [isLoading, setIsLoading] = useState(true);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    void (async () => {
+      try {
+        const response = await fetch("/api/workspace/latest", {
+          method: "GET",
+          credentials: "include",
+          cache: "no-store",
+        });
+        if (!response.ok) return;
+        const data = (await response.json()) as { workspace?: Workspace };
+        if (!data.workspace || cancelled) return;
+
+        saveWorkspace(data.workspace);
+        setWorkspace(data.workspace);
+      } catch {
+        // Keep local fallback when server sync fails.
+      } finally {
+        if (!cancelled) setIsLoading(false);
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const updateWorkspace = useCallback((updater: (w: Workspace) => Workspace) => {
     setWorkspace((prev) => {
@@ -32,7 +66,7 @@ export function WorkspaceProvider({ children }: { children: React.ReactNode }) {
 
   return (
     <WorkspaceContext.Provider
-      value={{ workspace, isLoading: false, updateWorkspace }}
+      value={{ workspace, isLoading, updateWorkspace }}
     >
       {children}
     </WorkspaceContext.Provider>

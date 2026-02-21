@@ -1,125 +1,366 @@
 "use client";
 
-import { Upload, MoreHorizontal } from "lucide-react";
-import { useCallback, useMemo } from "react";
-import { NotebookEditor } from "@/components/notebook/NotebookEditor";
-import { ExtractedIdeasPanel } from "@/components/ideas/ExtractedIdeasPanel";
-import { RefineNotesButton } from "@/components/notebook/RefineNotesButton";
+import Link from "next/link";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Loader2, Sparkles } from "lucide-react";
 import { useWorkspace } from "@/components/providers/WorkspaceProvider";
+import type { Project, Workspace } from "@/lib/workspace-store";
 
-function formatLongDate(value: string): string {
-  const d = new Date(value);
-  if (Number.isNaN(d.getTime())) return value;
+type RunStatus =
+  | "queued"
+  | "threading"
+  | "specing"
+  | "planning"
+  | "ready"
+  | "failed";
 
-  const day = d.getDate();
-  const suffix =
-    day % 10 === 1 && day !== 11
-      ? "st"
-      : day % 10 === 2 && day !== 12
-        ? "nd"
-        : day % 10 === 3 && day !== 13
-          ? "rd"
-          : "th";
+interface RunRecord {
+  id: string;
+  noteId: string;
+  status: RunStatus;
+  createdAt: string;
+  updatedAt: string;
+  error?: string;
+  projectId?: string;
+}
 
-  return `${d.toLocaleDateString("en-US", {
-    month: "long",
-  })} ${day}${suffix}, ${d.getFullYear()}`;
+interface WorkspaceLatestResponse {
+  workspace: Workspace;
+  activeRun: RunRecord | null;
+}
+
+interface NoteSaveResponse {
+  note: { id: string };
+  workspace: Workspace;
+}
+
+interface RunResponse {
+  run: RunRecord;
+  workspace: Workspace;
+}
+
+const RUN_PROGRESS_LABEL: Record<RunStatus, string> = {
+  queued: "Queued for processing",
+  threading: "Separating distinct idea threads",
+  specing: "Extracting requirements and constraints",
+  planning: "Generating milestones, tasks, and cutline",
+  ready: "Project package ready",
+  failed: "Generation failed",
+};
+
+const ACTIVE_STATUSES: RunStatus[] = [
+  "queued",
+  "threading",
+  "specing",
+  "planning",
+];
+
+function contentFingerprint(content: string) {
+  const normalized = content.replace(/\s+/g, " ").trim();
+  return `${normalized.length}:${normalized.slice(0, 80)}`;
+}
+
+function isActive(status: RunStatus) {
+  return ACTIVE_STATUSES.includes(status);
 }
 
 export function NotebookPageContent() {
   const { workspace, isLoading, updateWorkspace } = useWorkspace();
 
-  const currentEntry = workspace?.notebooks[0] ?? null;
-  const currentDate = useMemo(
-    () => (currentEntry ? formatLongDate(currentEntry.createdAt) : ""),
-    [currentEntry]
-  );
+  const [content, setContent] = useState("");
+  const [noteId, setNoteId] = useState<string | null>(null);
+  const [latestProject, setLatestProject] = useState<Project | null>(null);
+  const [run, setRun] = useState<RunRecord | null>(null);
+  const [saveState, setSaveState] = useState<
+    "idle" | "saving" | "saved" | "error"
+  >("idle");
+  const [bootstrapped, setBootstrapped] = useState(false);
 
-  const handleContentChange = useCallback(
-    (content: string) => {
-      if (!currentEntry) return;
+  const lastSavedFingerprint = useRef("");
+  const lastQueuedFingerprint = useRef("");
+  const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const queueTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-      updateWorkspace((w) => ({
-        ...w,
-        notebooks: w.notebooks.map((n) =>
-          n.id === currentEntry.id
-            ? { ...n, content, updatedAt: new Date().toISOString() }
-            : n
-        ),
-      }));
+  const syncWorkspace = useCallback(
+    (next: Workspace) => {
+      updateWorkspace(() => next);
+      setLatestProject(next.projects[0] ?? null);
+      const firstNote = next.notebooks[0];
+      if (firstNote) {
+        setNoteId(firstNote.id);
+      }
     },
-    [currentEntry, updateWorkspace]
+    [updateWorkspace]
   );
 
-  if (isLoading || !currentEntry) {
+  const bootstrap = useCallback(async () => {
+    try {
+      const response = await fetch("/api/workspace/latest", {
+        method: "GET",
+        cache: "no-store",
+        credentials: "include",
+      });
+      if (!response.ok) return;
+
+      const payload = (await response.json()) as WorkspaceLatestResponse;
+      syncWorkspace(payload.workspace);
+
+      const firstNote = payload.workspace.notebooks[0];
+      if (firstNote) {
+        setContent(firstNote.content);
+        setNoteId(firstNote.id);
+        lastSavedFingerprint.current = contentFingerprint(firstNote.content);
+      }
+
+      if (payload.activeRun) {
+        setRun(payload.activeRun);
+      }
+    } catch {
+      // keep local state when bootstrap request fails
+    } finally {
+      setBootstrapped(true);
+    }
+  }, [syncWorkspace]);
+
+  useEffect(() => {
+    if (!isLoading) {
+      void bootstrap();
+    }
+  }, [bootstrap, isLoading]);
+
+  const persistNote = useCallback(async (): Promise<string | null> => {
+    const trimmed = content.trim();
+    if (!trimmed) return noteId;
+
+    const fingerprint = contentFingerprint(content);
+    if (fingerprint === lastSavedFingerprint.current) {
+      return noteId;
+    }
+
+    setSaveState("saving");
+    try {
+      const response = await fetch("/api/workspace/note", {
+        method: "POST",
+        credentials: "include",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          content,
+          noteId: noteId ?? undefined,
+        }),
+      });
+
+      if (!response.ok) {
+        setSaveState("error");
+        return noteId;
+      }
+
+      const payload = (await response.json()) as NoteSaveResponse;
+      const savedId = payload.note.id;
+      setNoteId(savedId);
+      syncWorkspace(payload.workspace);
+      lastSavedFingerprint.current = fingerprint;
+      setSaveState("saved");
+      return savedId;
+    } catch {
+      setSaveState("error");
+      return noteId;
+    }
+  }, [content, noteId, syncWorkspace]);
+
+  const queueRun = useCallback(
+    async (reason: "idle" | "blur") => {
+      const trimmed = content.trim();
+      if (trimmed.length < 20) return;
+      if (run && isActive(run.status)) return;
+
+      const fingerprint = contentFingerprint(content);
+      if (fingerprint === lastQueuedFingerprint.current) return;
+
+      const currentNoteId = (await persistNote()) ?? noteId;
+      if (!currentNoteId) return;
+
+      try {
+        const response = await fetch("/api/runs", {
+          method: "POST",
+          credentials: "include",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            noteId: currentNoteId,
+            reason,
+          }),
+        });
+
+        if (!response.ok) return;
+        const payload = (await response.json()) as RunResponse;
+        setRun(payload.run);
+        syncWorkspace(payload.workspace);
+        lastQueuedFingerprint.current = fingerprint;
+      } catch {
+        // non-blocking
+      }
+    },
+    [content, noteId, persistNote, run, syncWorkspace]
+  );
+
+  useEffect(() => {
+    if (!bootstrapped) return;
+    if (!content.trim()) return;
+
+    if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
+    saveTimerRef.current = setTimeout(() => {
+      void persistNote();
+    }, 900);
+
+    return () => {
+      if (saveTimerRef.current) {
+        clearTimeout(saveTimerRef.current);
+        saveTimerRef.current = null;
+      }
+    };
+  }, [bootstrapped, content, persistNote]);
+
+  useEffect(() => {
+    if (!bootstrapped) return;
+    if (!content.trim()) return;
+
+    if (queueTimerRef.current) clearTimeout(queueTimerRef.current);
+    queueTimerRef.current = setTimeout(() => {
+      void queueRun("idle");
+    }, 45_000);
+
+    return () => {
+      if (queueTimerRef.current) {
+        clearTimeout(queueTimerRef.current);
+        queueTimerRef.current = null;
+      }
+    };
+  }, [bootstrapped, content, queueRun]);
+
+  useEffect(() => {
+    const onBlur = () => {
+      void queueRun("blur");
+    };
+    window.addEventListener("blur", onBlur);
+    return () => window.removeEventListener("blur", onBlur);
+  }, [queueRun]);
+
+  useEffect(() => {
+    if (!run || !isActive(run.status)) return;
+
+    const poll = setInterval(async () => {
+      try {
+        const response = await fetch(`/api/runs/${run.id}`, {
+          method: "GET",
+          credentials: "include",
+          cache: "no-store",
+        });
+        if (!response.ok) return;
+
+        const payload = (await response.json()) as RunResponse;
+        setRun(payload.run);
+        syncWorkspace(payload.workspace);
+
+        if (payload.run.status === "ready") {
+          lastQueuedFingerprint.current = contentFingerprint(content);
+        }
+      } catch {
+        // keep polling quiet on transient failures
+      }
+    }, 2_000);
+
+    return () => clearInterval(poll);
+  }, [content, run, syncWorkspace]);
+
+  useEffect(() => {
+    if (!bootstrapped && workspace?.notebooks?.[0]) {
+      setContent(workspace.notebooks[0].content);
+      setNoteId(workspace.notebooks[0].id);
+      setLatestProject(workspace.projects[0] ?? null);
+    }
+  }, [bootstrapped, workspace]);
+
+  const runLabel = useMemo(() => {
+    if (!run) return "";
+    return RUN_PROGRESS_LABEL[run.status];
+  }, [run]);
+
+  const saveLabel =
+    saveState === "saving"
+      ? "Saving..."
+      : saveState === "saved"
+        ? "Saved"
+        : saveState === "error"
+          ? "Save failed"
+          : "Idle";
+
+  if (isLoading && !bootstrapped) {
     return (
-      <div className="flex h-screen items-center justify-center">
-        <div className="text-zinc-500">Loading...</div>
+      <div className="flex h-screen items-center justify-center bg-[#fffdf8]">
+        <Loader2 className="h-5 w-5 animate-spin text-[#6f6a63]" />
       </div>
     );
   }
 
   return (
-    <div className="flex h-screen overflow-hidden bg-[#fcf9f2] text-[#33312d]">
-      <section className="relative flex min-w-0 flex-1 flex-col overflow-hidden">
-        <header className="flex h-20 items-center justify-between border-b border-[#e5dfd3] bg-[#fcf9f2] px-10">
-          <div className="flex items-end gap-4">
-            <h1 className="font-serif text-5xl font-bold leading-none tracking-tight">
-              Daily Log
-            </h1>
-            <span className="pb-1 font-editor text-xl italic text-[#a49f97]">
-              {currentDate}
-            </span>
-          </div>
-          <div className="flex items-center gap-2">
-            <span className="mr-2 text-xs italic text-[#9f998f]">Saved</span>
-            <button
-              type="button"
-              className="rounded-full p-2 text-[#9f998f] transition hover:bg-[#f1ece2] hover:text-[#393734]"
-              aria-label="Share"
-            >
-              <Upload className="h-4 w-4" />
-            </button>
-            <button
-              type="button"
-              className="rounded-full p-2 text-[#9f998f] transition hover:bg-[#f1ece2] hover:text-[#393734]"
-              aria-label="More options"
-            >
-              <MoreHorizontal className="h-4 w-4" />
-            </button>
-          </div>
-        </header>
-
-        <div className="flex min-h-0 flex-1 flex-col">
-          <div className="flex-1 overflow-auto px-10 pb-28 pt-6">
-            <div className="mx-auto max-w-4xl">
-              <NotebookEditor
-                content={currentEntry.content}
-                onChange={handleContentChange}
-              />
-            </div>
+    <div className="min-h-screen bg-[#fffdf8] text-[#2d2b28]">
+      <div className="mx-auto max-w-4xl px-6 pb-16 pt-12">
+        <div className="mb-6 flex items-center justify-between">
+          <h1 className="font-serif text-[2.7rem] font-semibold tracking-tight">
+            Notebook
+          </h1>
+          <div className="flex items-center gap-2 text-xs text-[#7b766e]">
+            <span>{saveLabel}</span>
+            {run && (
+              <span className="inline-flex items-center gap-1 rounded-full border border-[#e2ddd3] bg-white px-2 py-1">
+                {isActive(run.status) && (
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                )}
+                {runLabel}
+              </span>
+            )}
           </div>
         </div>
 
-        <RefineNotesButton
-          className="left-auto right-[22rem] translate-x-0"
-          content={currentEntry.content}
-          onRefineComplete={(ideas, project) => {
-            updateWorkspace((w) => {
-              const projects = w.projects.filter((p) => p.id !== "refined");
-              return {
-                ...w,
-                extractedIdeas: ideas,
-                projects: [{ ...project, id: "refined", prItems: [] }, ...projects],
-              };
-            });
-          }}
-        />
-      </section>
+        {latestProject && (
+          <div className="mb-8 rounded-xl border border-[#e4dfd5] bg-white p-5 shadow-[0_2px_8px_rgba(0,0,0,0.04)]">
+            <div className="mb-2 flex items-center gap-2 text-sm text-[#66615a]">
+              <Sparkles className="h-4 w-4" />
+              Your latest project package is ready
+            </div>
+            <h2 className="font-serif text-2xl font-semibold">{latestProject.name}</h2>
+            <p className="mt-2 text-sm text-[#6f6a63]">
+              Spec, milestones, dependency-aware tasks, and generated issues are
+              ready for review.
+            </p>
+            <div className="mt-4 flex flex-wrap gap-2">
+              <Link
+                href={`/projects/${latestProject.id}/spec`}
+                className="rounded-md bg-[#1f1f1f] px-3 py-2 text-sm font-medium text-white transition hover:bg-black"
+              >
+                Open Spec
+              </Link>
+              <Link
+                href={`/projects/${latestProject.id}/roadmap`}
+                className="rounded-md border border-[#d9d4ca] bg-white px-3 py-2 text-sm font-medium text-[#2d2b28] transition hover:bg-[#f5f2ea]"
+              >
+                Open Roadmap
+              </Link>
+            </div>
+          </div>
+        )}
 
-      <aside className="hidden w-[380px] shrink-0 border-l border-[#e3ddd2] bg-white lg:flex">
-        <ExtractedIdeasPanel />
-      </aside>
+        <textarea
+          value={content}
+          onChange={(event) => setContent(event.target.value)}
+          placeholder="Drop your idea here. Bullets, links, fragments, half-thoughts. Just write and walk away."
+          className="min-h-[68vh] w-full resize-none border-0 bg-transparent font-editor text-[1.9rem] leading-[1.75] text-[#2f2d29] placeholder:text-[#a59f95] focus:outline-none"
+        />
+
+        <p className="mt-4 text-xs text-[#8b867e]">
+          Auto-saves while you type. Auto-generates after inactivity or when you
+          leave this tab.
+        </p>
+      </div>
     </div>
   );
 }

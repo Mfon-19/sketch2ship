@@ -5,6 +5,10 @@ import { AppSidebar } from "@/components/layout/AppSidebar";
 import { MobileNav } from "@/components/layout/MobileNav";
 
 function isStandaloneRoute(pathname: string): boolean {
+  if (pathname === "/") {
+    return true;
+  }
+
   if (pathname.startsWith("/mission-control")) {
     return true;
   }
