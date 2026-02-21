@@ -5,14 +5,13 @@ import { usePathname, useRouter } from "next/navigation";
 import {
   BookOpenText,
   FolderOpen,
-  SendHorizontal,
-  SlidersHorizontal,
   SquarePen,
   UserRound,
   NotebookPen,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useWorkspace } from "@/components/providers/WorkspaceProvider";
+import { createDefaultCanvas } from "@/lib/workspace-store";
 
 const navItems = [
   { href: "/", label: "Overview", icon: BookOpenText, exact: true },
@@ -22,8 +21,6 @@ const navItems = [
     icon: FolderOpen,
     pathMatch: "/projects",
   },
-  { href: "/mission-control", label: "Shipments", icon: SendHorizontal },
-  { href: "/settings", label: "Settings", icon: SlidersHorizontal },
 ];
 
 export function AppSidebar() {
@@ -41,7 +38,7 @@ export function AppSidebar() {
         {
           id,
           title: "Daily Log",
-          content: "<p></p>",
+          canvas: createDefaultCanvas(),
           createdAt: now,
           updatedAt: now,
         },

@@ -1,183 +1,319 @@
 "use client";
 
 import Link from "next/link";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Loader2, Sparkles } from "lucide-react";
+import { useRouter } from "next/navigation";
+import {
+  Loader2,
+  Move,
+  Plus,
+  Sparkles,
+  Trash2,
+  ZoomIn,
+  ZoomOut,
+} from "lucide-react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  type MouseEvent as ReactMouseEvent,
+  useRef,
+  useState,
+} from "react";
 import { useWorkspace } from "@/components/providers/WorkspaceProvider";
-import type { Project, Workspace } from "@/lib/workspace-store";
+import type { AreaSummary, NotePatch, RunStatus, WorkspaceLatestResponse } from "@/lib/notebook-types";
+import type { NotebookBlock, NotebookViewport, Workspace } from "@/lib/workspace-store";
+import { createDefaultViewport } from "@/lib/workspace-store";
 
-type RunStatus =
-  | "queued"
-  | "threading"
-  | "specing"
-  | "planning"
-  | "ready"
-  | "failed";
+const ACTIVE_STATUSES: RunStatus[] = ["queued", "threading", "specing", "planning"];
+const WORLD_SIZE = 200000;
 
-interface RunRecord {
-  id: string;
-  noteId: string;
-  status: RunStatus;
-  createdAt: string;
-  updatedAt: string;
-  error?: string;
-  projectId?: string;
-}
-
-interface WorkspaceLatestResponse {
-  workspace: Workspace;
-  activeRun: RunRecord | null;
-}
-
-interface NoteSaveResponse {
-  note: { id: string };
-  workspace: Workspace;
-}
-
-interface RunResponse {
-  run: RunRecord;
-  workspace: Workspace;
-}
-
-const RUN_PROGRESS_LABEL: Record<RunStatus, string> = {
-  queued: "Queued for processing",
-  threading: "Separating distinct idea threads",
-  specing: "Extracting requirements and constraints",
-  planning: "Generating milestones, tasks, and cutline",
-  ready: "Project package ready",
-  failed: "Generation failed",
+const STATUS_LABEL: Record<string, string> = {
+  idle: "Waiting",
+  queued: "Queued",
+  threading: "Threading",
+  specing: "Extracting spec",
+  planning: "Planning",
+  ready: "Ready",
+  failed: "Failed",
 };
 
-const ACTIVE_STATUSES: RunStatus[] = [
-  "queued",
-  "threading",
-  "specing",
-  "planning",
-];
-
-function contentFingerprint(content: string) {
-  const normalized = content.replace(/\s+/g, " ").trim();
-  return `${normalized.length}:${normalized.slice(0, 80)}`;
+function nowIso() {
+  return new Date().toISOString();
 }
 
-function isActive(status: RunStatus) {
-  return ACTIVE_STATUSES.includes(status);
+function clampZoom(next: number) {
+  return Math.min(2.5, Math.max(0.4, next));
+}
+
+function generateBlock(x: number, y: number): NotebookBlock {
+  return {
+    id: crypto.randomUUID?.() ?? `block-${Date.now()}`,
+    x,
+    y,
+    w: 440,
+    h: 260,
+    content: "",
+    updatedAt: nowIso(),
+  };
+}
+
+function compactPatches(patches: NotePatch[]): NotePatch[] {
+  const upserts = new Map<string, NotePatch & { op: "upsert_block" }>();
+  const deletes = new Set<string>();
+  let viewportPatch: NotePatch | null = null;
+  const passthrough: NotePatch[] = [];
+
+  for (const patch of patches) {
+    if (patch.op === "upsert_block") {
+      deletes.delete(patch.block.id);
+      upserts.set(patch.block.id, patch);
+      continue;
+    }
+
+    if (patch.op === "delete_block") {
+      upserts.delete(patch.blockId);
+      deletes.add(patch.blockId);
+      continue;
+    }
+
+    if (patch.op === "set_viewport") {
+      viewportPatch = patch;
+      continue;
+    }
+
+    passthrough.push(patch);
+  }
+
+  return [
+    ...passthrough,
+    ...[...deletes].map((blockId) => ({ op: "delete_block", blockId }) as NotePatch),
+    ...upserts.values(),
+    ...(viewportPatch ? [viewportPatch] : []),
+  ];
+}
+
+function mergeServerAreaIds(
+  localBlocks: NotebookBlock[],
+  serverBlocks: NotebookBlock[]
+): NotebookBlock[] {
+  const byId = new Map(serverBlocks.map((block) => [block.id, block]));
+  const merged: NotebookBlock[] = localBlocks
+    .filter((block) => byId.has(block.id))
+    .map((block) => ({
+      ...block,
+      areaId: byId.get(block.id)?.areaId,
+    }));
+
+  for (const serverBlock of serverBlocks) {
+    if (!merged.find((block) => block.id === serverBlock.id)) {
+      merged.push(serverBlock);
+    }
+  }
+
+  return merged;
 }
 
 export function NotebookPageContent() {
+  const router = useRouter();
   const { workspace, isLoading, updateWorkspace } = useWorkspace();
 
-  const [content, setContent] = useState("");
   const [noteId, setNoteId] = useState<string | null>(null);
-  const [latestProject, setLatestProject] = useState<Project | null>(null);
-  const [run, setRun] = useState<RunRecord | null>(null);
-  const [saveState, setSaveState] = useState<
-    "idle" | "saving" | "saved" | "error"
-  >("idle");
+  const [blocks, setBlocks] = useState<NotebookBlock[]>([]);
+  const [viewport, setViewport] = useState<NotebookViewport>(createDefaultViewport());
+  const [areaSummaries, setAreaSummaries] = useState<AreaSummary[]>([]);
+  const [saveState, setSaveState] = useState<"idle" | "saving" | "saved" | "error">(
+    "idle"
+  );
   const [bootstrapped, setBootstrapped] = useState(false);
 
-  const lastSavedFingerprint = useRef("");
-  const lastQueuedFingerprint = useRef("");
-  const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const queueTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const canvasRef = useRef<HTMLDivElement | null>(null);
+  const pendingPatchesRef = useRef<NotePatch[]>([]);
+  const flushTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const idleQueueTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const lastQueuedAreaRef = useRef<Record<string, string>>({});
+
+  const interactionRef = useRef<
+    | { type: "none" }
+    | {
+        type: "panning";
+        pointerId: number;
+        startX: number;
+        startY: number;
+        originX: number;
+        originY: number;
+      }
+    | {
+        type: "dragging";
+        pointerId: number;
+        blockId: string;
+        startX: number;
+        startY: number;
+        originX: number;
+        originY: number;
+      }
+    | {
+        type: "resizing";
+        pointerId: number;
+        blockId: string;
+        startX: number;
+        startY: number;
+        originW: number;
+        originH: number;
+      }
+  >({ type: "none" });
 
   const syncWorkspace = useCallback(
     (next: Workspace) => {
       updateWorkspace(() => next);
-      setLatestProject(next.projects[0] ?? null);
-      const firstNote = next.notebooks[0];
-      if (firstNote) {
-        setNoteId(firstNote.id);
-      }
     },
     [updateWorkspace]
   );
 
-  const bootstrap = useCallback(async () => {
-    try {
-      const response = await fetch("/api/workspace/latest", {
-        method: "GET",
-        cache: "no-store",
-        credentials: "include",
-      });
-      if (!response.ok) return;
+  const refreshLatest = useCallback(async () => {
+    const response = await fetch("/api/workspace/latest", {
+      method: "GET",
+      cache: "no-store",
+      credentials: "include",
+    });
+    if (!response.ok) return null;
 
-      const payload = (await response.json()) as WorkspaceLatestResponse;
-      syncWorkspace(payload.workspace);
+    const payload = (await response.json()) as WorkspaceLatestResponse;
+    syncWorkspace(payload.workspace);
+    setAreaSummaries(payload.areaSummaries ?? []);
 
-      const firstNote = payload.workspace.notebooks[0];
-      if (firstNote) {
-        setContent(firstNote.content);
-        setNoteId(firstNote.id);
-        lastSavedFingerprint.current = contentFingerprint(firstNote.content);
-      }
-
-      if (payload.activeRun) {
-        setRun(payload.activeRun);
-      }
-    } catch {
-      // keep local state when bootstrap request fails
-    } finally {
-      setBootstrapped(true);
+    const firstNote =
+      payload.workspace.notebooks.find((note) => note.id === payload.latestNoteId) ??
+      payload.workspace.notebooks[0];
+    if (firstNote) {
+      setNoteId(firstNote.id);
+      setViewport(firstNote.canvas.viewport ?? createDefaultViewport());
+      setBlocks((previous) =>
+        previous.length
+          ? mergeServerAreaIds(previous, firstNote.canvas.blocks)
+          : firstNote.canvas.blocks
+      );
     }
+
+    return payload;
   }, [syncWorkspace]);
 
   useEffect(() => {
-    if (!isLoading) {
-      void bootstrap();
-    }
-  }, [bootstrap, isLoading]);
+    if (isLoading || bootstrapped) return;
 
-  const persistNote = useCallback(async (): Promise<string | null> => {
-    const trimmed = content.trim();
-    if (!trimmed) return noteId;
-
-    const fingerprint = contentFingerprint(content);
-    if (fingerprint === lastSavedFingerprint.current) {
-      return noteId;
-    }
-
-    setSaveState("saving");
-    try {
-      const response = await fetch("/api/workspace/note", {
-        method: "POST",
-        credentials: "include",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          content,
-          noteId: noteId ?? undefined,
-        }),
-      });
-
-      if (!response.ok) {
-        setSaveState("error");
-        return noteId;
+    void (async () => {
+      try {
+        await refreshLatest();
+      } finally {
+        setBootstrapped(true);
       }
+    })();
+  }, [bootstrapped, isLoading, refreshLatest]);
 
-      const payload = (await response.json()) as NoteSaveResponse;
-      const savedId = payload.note.id;
-      setNoteId(savedId);
-      syncWorkspace(payload.workspace);
-      lastSavedFingerprint.current = fingerprint;
-      setSaveState("saved");
-      return savedId;
-    } catch {
-      setSaveState("error");
-      return noteId;
-    }
-  }, [content, noteId, syncWorkspace]);
+  const queuePatch = useCallback((patch: NotePatch) => {
+    pendingPatchesRef.current.push(patch);
+    if (flushTimerRef.current) return;
 
-  const queueRun = useCallback(
-    async (reason: "idle" | "blur") => {
-      const trimmed = content.trim();
-      if (trimmed.length < 20) return;
-      if (run && isActive(run.status)) return;
+    flushTimerRef.current = setTimeout(async () => {
+      flushTimerRef.current = null;
+      const raw = pendingPatchesRef.current;
+      if (raw.length === 0) return;
+      pendingPatchesRef.current = [];
+      const patches = compactPatches(raw);
 
-      const fingerprint = contentFingerprint(content);
-      if (fingerprint === lastQueuedFingerprint.current) return;
+      setSaveState("saving");
+      try {
+        const response = await fetch("/api/workspace/note", {
+          method: "POST",
+          credentials: "include",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            noteId: noteId ?? undefined,
+            patches,
+          }),
+        });
 
-      const currentNoteId = (await persistNote()) ?? noteId;
-      if (!currentNoteId) return;
+        if (!response.ok) {
+          setSaveState("error");
+          return;
+        }
+
+        const payload = (await response.json()) as {
+          note: {
+            id: string;
+            canvas: {
+              viewport: NotebookViewport;
+              blocks: NotebookBlock[];
+            };
+          };
+          workspace: Workspace;
+          areaSummaries: AreaSummary[];
+        };
+
+        setNoteId(payload.note.id);
+        setAreaSummaries(payload.areaSummaries ?? []);
+        setViewport(payload.note.canvas.viewport);
+        setBlocks((previous) =>
+          previous.length
+            ? mergeServerAreaIds(previous, payload.note.canvas.blocks)
+            : payload.note.canvas.blocks
+        );
+        syncWorkspace(payload.workspace);
+        setSaveState("saved");
+      } catch {
+        setSaveState("error");
+      }
+    }, 550);
+  }, [noteId, syncWorkspace]);
+
+  const toWorldPoint = useCallback(
+    (clientX: number, clientY: number) => {
+      const rect = canvasRef.current?.getBoundingClientRect();
+      if (!rect) return { x: 0, y: 0 };
+      return {
+        x: (clientX - rect.left - viewport.x) / viewport.zoom,
+        y: (clientY - rect.top - viewport.y) / viewport.zoom,
+      };
+    },
+    [viewport]
+  );
+
+  const updateBlock = useCallback((blockId: string, updater: (block: NotebookBlock) => NotebookBlock) => {
+    setBlocks((previous) =>
+      previous.map((block) => (block.id === blockId ? updater(block) : block))
+    );
+  }, []);
+
+  const deleteBlock = useCallback((blockId: string) => {
+    setBlocks((previous) => previous.filter((block) => block.id !== blockId));
+    queuePatch({ op: "delete_block", blockId });
+  }, [queuePatch]);
+
+  const onCanvasDoubleClick = useCallback(
+    (event: ReactMouseEvent<HTMLDivElement>) => {
+      const target = event.target as HTMLElement;
+      if (target.closest("[data-notebook-block='true']")) return;
+
+      const world = toWorldPoint(event.clientX, event.clientY);
+      const block = generateBlock(world.x - 180, world.y - 100);
+      setBlocks((previous) => [...previous, block]);
+      queuePatch({ op: "upsert_block", block });
+    },
+    [queuePatch, toWorldPoint]
+  );
+
+  const queueRunsForAreas = useCallback(async () => {
+    const currentNoteId = noteId;
+    if (!currentNoteId || areaSummaries.length === 0) return;
+
+    for (const area of areaSummaries) {
+      if (!area.preview.trim()) continue;
+      const fingerprint = `${area.preview}:${area.blockIds.join(",")}`;
+      if (
+        area.status === "ready" &&
+        lastQueuedAreaRef.current[area.id] === fingerprint
+      ) {
+        continue;
+      }
 
       try {
         const response = await fetch("/api/runs", {
@@ -186,112 +322,185 @@ export function NotebookPageContent() {
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             noteId: currentNoteId,
-            reason,
+            areaId: area.id,
           }),
         });
-
-        if (!response.ok) return;
-        const payload = (await response.json()) as RunResponse;
-        setRun(payload.run);
-        syncWorkspace(payload.workspace);
-        lastQueuedFingerprint.current = fingerprint;
+        if (!response.ok) continue;
+        lastQueuedAreaRef.current[area.id] = fingerprint;
       } catch {
-        // non-blocking
+        // ignore transient queue failures
       }
-    },
-    [content, noteId, persistNote, run, syncWorkspace]
-  );
+    }
+
+    await refreshLatest();
+  }, [areaSummaries, noteId, refreshLatest]);
 
   useEffect(() => {
     if (!bootstrapped) return;
-    if (!content.trim()) return;
-
-    if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
-    saveTimerRef.current = setTimeout(() => {
-      void persistNote();
-    }, 900);
-
-    return () => {
-      if (saveTimerRef.current) {
-        clearTimeout(saveTimerRef.current);
-        saveTimerRef.current = null;
-      }
-    };
-  }, [bootstrapped, content, persistNote]);
-
-  useEffect(() => {
-    if (!bootstrapped) return;
-    if (!content.trim()) return;
-
-    if (queueTimerRef.current) clearTimeout(queueTimerRef.current);
-    queueTimerRef.current = setTimeout(() => {
-      void queueRun("idle");
+    if (idleQueueTimerRef.current) clearTimeout(idleQueueTimerRef.current);
+    idleQueueTimerRef.current = setTimeout(() => {
+      void queueRunsForAreas();
     }, 45_000);
 
     return () => {
-      if (queueTimerRef.current) {
-        clearTimeout(queueTimerRef.current);
-        queueTimerRef.current = null;
+      if (idleQueueTimerRef.current) {
+        clearTimeout(idleQueueTimerRef.current);
+        idleQueueTimerRef.current = null;
       }
     };
-  }, [bootstrapped, content, queueRun]);
+  }, [blocks, bootstrapped, queueRunsForAreas, viewport]);
 
   useEffect(() => {
     const onBlur = () => {
-      void queueRun("blur");
+      void queueRunsForAreas();
     };
+
     window.addEventListener("blur", onBlur);
     return () => window.removeEventListener("blur", onBlur);
-  }, [queueRun]);
+  }, [queueRunsForAreas]);
+
+  const hasActiveAreas = areaSummaries.some((area) =>
+    ACTIVE_STATUSES.includes(area.status as RunStatus)
+  );
 
   useEffect(() => {
-    if (!run || !isActive(run.status)) return;
-
-    const poll = setInterval(async () => {
-      try {
-        const response = await fetch(`/api/runs/${run.id}`, {
-          method: "GET",
-          credentials: "include",
-          cache: "no-store",
-        });
-        if (!response.ok) return;
-
-        const payload = (await response.json()) as RunResponse;
-        setRun(payload.run);
-        syncWorkspace(payload.workspace);
-
-        if (payload.run.status === "ready") {
-          lastQueuedFingerprint.current = contentFingerprint(content);
-        }
-      } catch {
-        // keep polling quiet on transient failures
-      }
-    }, 2_000);
-
+    if (!hasActiveAreas) return;
+    const poll = setInterval(() => {
+      void refreshLatest();
+    }, 2200);
     return () => clearInterval(poll);
-  }, [content, run, syncWorkspace]);
+  }, [hasActiveAreas, refreshLatest]);
+
+  const onPointerMove = useCallback(
+    (event: PointerEvent) => {
+      const interaction = interactionRef.current;
+      if (interaction.type === "none") return;
+
+      if (interaction.type === "panning") {
+        const dx = event.clientX - interaction.startX;
+        const dy = event.clientY - interaction.startY;
+        setViewport((previous) => ({
+          ...previous,
+          x: interaction.originX + dx,
+          y: interaction.originY + dy,
+        }));
+      }
+
+      if (interaction.type === "dragging") {
+        const dx = (event.clientX - interaction.startX) / viewport.zoom;
+        const dy = (event.clientY - interaction.startY) / viewport.zoom;
+        updateBlock(interaction.blockId, (block) => ({
+          ...block,
+          x: interaction.originX + dx,
+          y: interaction.originY + dy,
+          updatedAt: nowIso(),
+        }));
+      }
+
+      if (interaction.type === "resizing") {
+        const dx = (event.clientX - interaction.startX) / viewport.zoom;
+        const dy = (event.clientY - interaction.startY) / viewport.zoom;
+        updateBlock(interaction.blockId, (block) => ({
+          ...block,
+          w: Math.max(260, interaction.originW + dx),
+          h: Math.max(160, interaction.originH + dy),
+          updatedAt: nowIso(),
+        }));
+      }
+    },
+    [updateBlock, viewport.zoom]
+  );
+
+  const onPointerUp = useCallback(() => {
+    const interaction = interactionRef.current;
+    interactionRef.current = { type: "none" };
+
+    if (interaction.type === "panning") {
+      queuePatch({ op: "set_viewport", viewport });
+      return;
+    }
+
+    if (interaction.type === "dragging" || interaction.type === "resizing") {
+      const block = blocks.find((item) => item.id === interaction.blockId);
+      if (block) {
+        queuePatch({ op: "upsert_block", block: { ...block, updatedAt: nowIso() } });
+      }
+    }
+  }, [blocks, queuePatch, viewport]);
 
   useEffect(() => {
-    if (!bootstrapped && workspace?.notebooks?.[0]) {
-      setContent(workspace.notebooks[0].content);
-      setNoteId(workspace.notebooks[0].id);
-      setLatestProject(workspace.projects[0] ?? null);
+    const move = (event: PointerEvent) => onPointerMove(event);
+    const up = () => onPointerUp();
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", up);
+    return () => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", up);
+    };
+  }, [onPointerMove, onPointerUp]);
+
+  const startPanning = (event: React.PointerEvent<HTMLDivElement>) => {
+    const target = event.target as HTMLElement;
+    if (target.closest("[data-notebook-block='true']")) return;
+
+    interactionRef.current = {
+      type: "panning",
+      pointerId: event.pointerId,
+      startX: event.clientX,
+      startY: event.clientY,
+      originX: viewport.x,
+      originY: viewport.y,
+    };
+  };
+
+  const zoomBy = (factor: number) => {
+    const rect = canvasRef.current?.getBoundingClientRect();
+    if (!rect) return;
+    const cx = rect.width / 2;
+    const cy = rect.height / 2;
+    const worldX = (cx - viewport.x) / viewport.zoom;
+    const worldY = (cy - viewport.y) / viewport.zoom;
+    const nextZoom = clampZoom(viewport.zoom * factor);
+    const nextX = cx - worldX * nextZoom;
+    const nextY = cy - worldY * nextZoom;
+    setViewport({ x: nextX, y: nextY, zoom: nextZoom });
+    queuePatch({
+      op: "set_viewport",
+      viewport: { x: nextX, y: nextY, zoom: nextZoom },
+    });
+  };
+
+  const onWheel = (event: React.WheelEvent<HTMLDivElement>) => {
+    if (!(event.metaKey || event.ctrlKey)) return;
+    event.preventDefault();
+    const rect = canvasRef.current?.getBoundingClientRect();
+    if (!rect) return;
+
+    const mouseX = event.clientX - rect.left;
+    const mouseY = event.clientY - rect.top;
+    const worldX = (mouseX - viewport.x) / viewport.zoom;
+    const worldY = (mouseY - viewport.y) / viewport.zoom;
+
+    const factor = event.deltaY > 0 ? 0.94 : 1.06;
+    const nextZoom = clampZoom(viewport.zoom * factor);
+    const nextX = mouseX - worldX * nextZoom;
+    const nextY = mouseY - worldY * nextZoom;
+
+    setViewport({ x: nextX, y: nextY, zoom: nextZoom });
+    queuePatch({
+      op: "set_viewport",
+      viewport: { x: nextX, y: nextY, zoom: nextZoom },
+    });
+  };
+
+  const areaProjectMap = useMemo(() => {
+    const map = new Map<string, string>();
+    for (const project of workspace?.projects ?? []) {
+      if (project.noteId !== noteId) continue;
+      if (project.areaId) map.set(project.areaId, project.id);
     }
-  }, [bootstrapped, workspace]);
-
-  const runLabel = useMemo(() => {
-    if (!run) return "";
-    return RUN_PROGRESS_LABEL[run.status];
-  }, [run]);
-
-  const saveLabel =
-    saveState === "saving"
-      ? "Saving..."
-      : saveState === "saved"
-        ? "Saved"
-        : saveState === "error"
-          ? "Save failed"
-          : "Idle";
+    return map;
+  }, [noteId, workspace?.projects]);
 
   if (isLoading && !bootstrapped) {
     return (
@@ -302,64 +511,193 @@ export function NotebookPageContent() {
   }
 
   return (
-    <div className="min-h-screen bg-[#fffdf8] text-[#2d2b28]">
-      <div className="mx-auto max-w-4xl px-6 pb-16 pt-12">
-        <div className="mb-6 flex items-center justify-between">
-          <h1 className="font-serif text-[2.7rem] font-semibold tracking-tight">
-            Notebook
-          </h1>
-          <div className="flex items-center gap-2 text-xs text-[#7b766e]">
-            <span>{saveLabel}</span>
-            {run && (
-              <span className="inline-flex items-center gap-1 rounded-full border border-[#e2ddd3] bg-white px-2 py-1">
-                {isActive(run.status) && (
-                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                )}
-                {runLabel}
-              </span>
-            )}
-          </div>
+    <div className="flex h-screen flex-col bg-[#fffdf8] text-[#2d2b28]">
+      <div className="flex h-14 items-center justify-between border-b border-[#e6dfd2] px-5">
+        <div className="flex items-center gap-3">
+          <h1 className="font-serif text-2xl font-semibold">Infinite Notebook</h1>
+          <button
+            onClick={() => {
+              const rect = canvasRef.current?.getBoundingClientRect();
+              const world = rect
+                ? toWorldPoint(rect.left + rect.width / 2, rect.top + rect.height / 2)
+                : { x: 0, y: 0 };
+              const block = generateBlock(world.x - 180, world.y - 100);
+              setBlocks((previous) => [...previous, block]);
+              queuePatch({ op: "upsert_block", block });
+            }}
+            className="inline-flex h-8 items-center gap-1 rounded-md border border-[#d9d3c8] bg-white px-2.5 text-xs font-medium text-[#3f3b35] hover:bg-[#f5f2ea]"
+          >
+            <Plus className="h-3.5 w-3.5" />
+            Add Block
+          </button>
         </div>
+        <div className="flex items-center gap-2 text-xs text-[#7a756d]">
+          <span>{saveState === "saving" ? "Saving..." : saveState === "saved" ? "Saved" : saveState === "error" ? "Save failed" : "Idle"}</span>
+          <span className="inline-flex items-center gap-1 rounded-full border border-[#e2ddd3] bg-white px-2 py-0.5">
+            <Sparkles className="h-3.5 w-3.5" />
+            {areaSummaries.length} idea area{areaSummaries.length === 1 ? "" : "s"}
+          </span>
+          <button
+            onClick={() => zoomBy(1.12)}
+            className="rounded border border-[#d9d3c8] bg-white p-1.5 hover:bg-[#f5f2ea]"
+            title="Zoom in"
+          >
+            <ZoomIn className="h-3.5 w-3.5" />
+          </button>
+          <button
+            onClick={() => zoomBy(0.88)}
+            className="rounded border border-[#d9d3c8] bg-white p-1.5 hover:bg-[#f5f2ea]"
+            title="Zoom out"
+          >
+            <ZoomOut className="h-3.5 w-3.5" />
+          </button>
+        </div>
+      </div>
 
-        {latestProject && (
-          <div className="mb-8 rounded-xl border border-[#e4dfd5] bg-white p-5 shadow-[0_2px_8px_rgba(0,0,0,0.04)]">
-            <div className="mb-2 flex items-center gap-2 text-sm text-[#66615a]">
-              <Sparkles className="h-4 w-4" />
-              Your latest project package is ready
-            </div>
-            <h2 className="font-serif text-2xl font-semibold">{latestProject.name}</h2>
-            <p className="mt-2 text-sm text-[#6f6a63]">
-              Spec, milestones, dependency-aware tasks, and generated issues are
-              ready for review.
-            </p>
-            <div className="mt-4 flex flex-wrap gap-2">
-              <Link
-                href={`/projects/${latestProject.id}/spec`}
-                className="rounded-md bg-[#1f1f1f] px-3 py-2 text-sm font-medium text-white transition hover:bg-black"
+      <div
+        ref={canvasRef}
+        className="relative flex-1 overflow-hidden bg-[radial-gradient(circle_at_1px_1px,rgba(120,112,96,0.16)_1px,transparent_0)] [background-size:28px_28px]"
+        onDoubleClick={onCanvasDoubleClick}
+        onPointerDown={startPanning}
+        onWheel={onWheel}
+      >
+        <div
+          className="absolute left-0 top-0"
+          style={{
+            width: `${WORLD_SIZE}px`,
+            height: `${WORLD_SIZE}px`,
+            transform: `translate(${viewport.x}px, ${viewport.y}px) scale(${viewport.zoom})`,
+            transformOrigin: "0 0",
+          }}
+        >
+          {blocks.map((block) => (
+            <div
+              key={block.id}
+              data-notebook-block="true"
+              className="absolute rounded-xl border border-[#d8d3ca] bg-white/95 shadow-[0_8px_18px_rgba(0,0,0,0.07)]"
+              style={{
+                left: block.x,
+                top: block.y,
+                width: block.w,
+                height: block.h,
+              }}
+            >
+              <div
+                className="flex h-8 cursor-move items-center justify-between rounded-t-xl border-b border-[#eee8de] bg-[#f9f6f0] px-2 text-[10px] uppercase tracking-[0.08em] text-[#7f7a72]"
+                onPointerDown={(event) => {
+                  event.stopPropagation();
+                  interactionRef.current = {
+                    type: "dragging",
+                    pointerId: event.pointerId,
+                    blockId: block.id,
+                    startX: event.clientX,
+                    startY: event.clientY,
+                    originX: block.x,
+                    originY: block.y,
+                  };
+                }}
               >
-                Open Spec
-              </Link>
-              <Link
-                href={`/projects/${latestProject.id}/roadmap`}
-                className="rounded-md border border-[#d9d4ca] bg-white px-3 py-2 text-sm font-medium text-[#2d2b28] transition hover:bg-[#f5f2ea]"
-              >
-                Open Roadmap
-              </Link>
+                <span className="inline-flex items-center gap-1">
+                  <Move className="h-3 w-3" />
+                  Text Area
+                </span>
+                <button
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    deleteBlock(block.id);
+                  }}
+                  className="rounded p-1 text-[#8f897f] hover:bg-[#ece8df] hover:text-[#3f3a34]"
+                  title="Delete block"
+                >
+                  <Trash2 className="h-3.5 w-3.5" />
+                </button>
+              </div>
+
+              <textarea
+                value={block.content}
+                onChange={(event) => {
+                  const nextBlock = {
+                    ...block,
+                    content: event.target.value,
+                    updatedAt: nowIso(),
+                  };
+                  updateBlock(block.id, () => nextBlock);
+                  queuePatch({ op: "upsert_block", block: nextBlock });
+                }}
+                placeholder="Type an idea here..."
+                className="h-[calc(100%-32px)] w-full resize-none bg-transparent px-3 py-2 font-editor text-[1.35rem] leading-[1.5] text-[#2f2d29] placeholder:text-[#aaa398] focus:outline-none"
+              />
+
+              <button
+                onPointerDown={(event) => {
+                  event.stopPropagation();
+                  interactionRef.current = {
+                    type: "resizing",
+                    pointerId: event.pointerId,
+                    blockId: block.id,
+                    startX: event.clientX,
+                    startY: event.clientY,
+                    originW: block.w,
+                    originH: block.h,
+                  };
+                }}
+                className="absolute bottom-1.5 right-1.5 h-3.5 w-3.5 cursor-nwse-resize rounded-sm border border-[#d5cfc3] bg-[#f3efe7]"
+                title="Resize"
+              />
             </div>
-          </div>
-        )}
+          ))}
 
-        <textarea
-          value={content}
-          onChange={(event) => setContent(event.target.value)}
-          placeholder="Drop your idea here. Bullets, links, fragments, half-thoughts. Just write and walk away."
-          className="min-h-[68vh] w-full resize-none border-0 bg-transparent font-editor text-[1.9rem] leading-[1.75] text-[#2f2d29] placeholder:text-[#a59f95] focus:outline-none"
-        />
+          {areaSummaries.map((area) => {
+            const linkedProjectId = area.projectId ?? areaProjectMap.get(area.id);
+            const isReady = area.status === "ready" && Boolean(linkedProjectId);
+            const isActive = ACTIVE_STATUSES.includes(area.status as RunStatus);
 
-        <p className="mt-4 text-xs text-[#8b867e]">
-          Auto-saves while you type. Auto-generates after inactivity or when you
-          leave this tab.
-        </p>
+            return (
+              <button
+                key={area.id}
+                onClick={() => {
+                  if (!linkedProjectId) return;
+                  router.push(`/projects/${linkedProjectId}/spec`);
+                }}
+                className="absolute -translate-x-1/2 -translate-y-[120%] rounded-full border border-[#d8d2c7] bg-white px-3 py-1 text-xs shadow-sm"
+                style={{
+                  left: area.centroid.x,
+                  top: area.centroid.y,
+                }}
+                title={isReady ? "Open generated spec" : area.preview}
+                disabled={!linkedProjectId}
+              >
+                <span className="inline-flex items-center gap-1">
+                  {isActive && <Loader2 className="h-3 w-3 animate-spin" />}
+                  <span
+                    className={
+                      area.status === "failed"
+                        ? "text-red-600"
+                        : area.status === "ready"
+                          ? "text-emerald-700"
+                          : "text-[#4f4b45]"
+                    }
+                  >
+                    {STATUS_LABEL[area.status] ?? area.status}
+                  </span>
+                </span>
+              </button>
+            );
+          })}
+        </div>
+      </div>
+
+      <div className="flex h-9 items-center justify-between border-t border-[#e6dfd2] px-4 text-[11px] text-[#867f74]">
+        <span>
+          Double-click empty canvas to create a new idea block. Distant blocks become
+          distinct idea areas.
+        </span>
+        <div className="flex items-center gap-3">
+          <span>Zoom: {Math.round(viewport.zoom * 100)}%</span>
+          <Link className="underline underline-offset-2" href="/projects">
+            Open Projects
+          </Link>
+        </div>
       </div>
     </div>
   );

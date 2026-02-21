@@ -22,8 +22,8 @@ export default function ProjectsPage() {
         <FolderOpen className="h-12 w-12 text-zinc-300" />
         <h1 className="text-xl font-semibold text-zinc-900">No projects yet</h1>
         <p className="max-w-sm text-center text-zinc-600">
-          Write your ideas in the Daily Log and click Refine Notes to generate a
-          project spec and roadmap.
+          Write your ideas in the notebook and wait for generation to produce a
+          full project spec and ship plan.
         </p>
         <Link
           href="/"
@@ -42,7 +42,7 @@ export default function ProjectsPage() {
         {projects.map((project) => (
           <Link
             key={project.id}
-            href={`/projects/${project.id}/roadmap`}
+            href={`/projects/${project.id}/spec`}
             className="rounded-lg border border-zinc-200 bg-white p-4 transition-colors hover:border-zinc-300 hover:bg-zinc-50"
           >
             <h2 className="font-medium text-zinc-900">{project.name}</h2>

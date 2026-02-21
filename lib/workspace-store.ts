@@ -10,10 +10,43 @@ import type {
 
 const STORAGE_KEY = "sketch2ship_workspace";
 
+export interface NotebookViewport {
+  x: number;
+  y: number;
+  zoom: number;
+}
+
+export interface NotebookBlock {
+  id: string;
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  content: string;
+  updatedAt: string;
+  areaId?: string;
+}
+
+export interface NotebookArea {
+  id: string;
+  blockIds: string[];
+  centroid: {
+    x: number;
+    y: number;
+  };
+}
+
+export interface NotebookCanvas {
+  viewport: NotebookViewport;
+  blocks: NotebookBlock[];
+  areas: NotebookArea[];
+}
+
 export interface NotebookEntry {
   id: string;
   title: string;
-  content: string;
+  content?: string;
+  canvas: NotebookCanvas;
   createdAt: string;
   updatedAt: string;
 }
@@ -37,6 +70,8 @@ export interface SourceNote {
 export interface Project {
   id: string;
   name: string;
+  noteId?: string;
+  areaId?: string;
   specSections: SpecSection[];
   milestones: Milestone[];
   sourceNote?: SourceNote;
@@ -64,6 +99,80 @@ export interface Workspace {
   lastUpdated: string;
 }
 
+export function createDefaultViewport(): NotebookViewport {
+  return {
+    x: 0,
+    y: 0,
+    zoom: 1,
+  };
+}
+
+export function createDefaultCanvas(): NotebookCanvas {
+  return {
+    viewport: createDefaultViewport(),
+    blocks: [],
+    areas: [],
+  };
+}
+
+export function createDefaultBlock(
+  overrides: Partial<NotebookBlock> = {}
+): NotebookBlock {
+  return {
+    id: crypto.randomUUID?.() ?? `block-${Date.now()}`,
+    x: 0,
+    y: 0,
+    w: 420,
+    h: 220,
+    content: "",
+    updatedAt: new Date().toISOString(),
+    ...overrides,
+  };
+}
+
+export function normalizeNotebookEntry(entry: NotebookEntry): NotebookEntry {
+  const hasCanvas = typeof entry.canvas === "object" && Array.isArray(entry.canvas?.blocks);
+  if (hasCanvas) {
+    return {
+      ...entry,
+      canvas: {
+        viewport: {
+          x: entry.canvas.viewport?.x ?? 0,
+          y: entry.canvas.viewport?.y ?? 0,
+          zoom: entry.canvas.viewport?.zoom ?? 1,
+        },
+        blocks: Array.isArray(entry.canvas.blocks)
+          ? entry.canvas.blocks.map((block) => ({
+              ...createDefaultBlock(),
+              ...block,
+            }))
+          : [],
+        areas: Array.isArray(entry.canvas.areas) ? entry.canvas.areas : [],
+      },
+    };
+  }
+
+  const legacyContent = entry.content ?? "";
+  return {
+    ...entry,
+    canvas: {
+      viewport: createDefaultViewport(),
+      blocks: legacyContent.trim()
+        ? [
+            createDefaultBlock({
+              x: 80,
+              y: 80,
+              w: 520,
+              h: 300,
+              content: legacyContent,
+            }),
+          ]
+        : [],
+      areas: [],
+    },
+  };
+}
+
 function createEmptyWorkspace(): Workspace {
   return {
     id: crypto.randomUUID?.() ?? `workspace-${Date.now()}`,
@@ -88,7 +197,13 @@ export function getWorkspace(): Workspace {
       return empty;
     }
 
-    return JSON.parse(raw) as Workspace;
+    const parsed = JSON.parse(raw) as Workspace;
+    return {
+      ...parsed,
+      notebooks: Array.isArray(parsed.notebooks)
+        ? parsed.notebooks.map((note) => normalizeNotebookEntry(note))
+        : [],
+    };
   } catch {
     const empty = createEmptyWorkspace();
     saveWorkspace(empty);

@@ -9,10 +9,6 @@ function isStandaloneRoute(pathname: string): boolean {
     return true;
   }
 
-  if (pathname.startsWith("/mission-control")) {
-    return true;
-  }
-
   return /^\/projects\/[^/]+\/(spec|roadmap)$/.test(pathname);
 }
 

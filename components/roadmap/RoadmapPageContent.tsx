@@ -61,8 +61,8 @@ export function RoadmapPageContent({ projectId }: RoadmapPageContentProps) {
             >
               Projects
             </Link>
-            <Link className="italic text-[#66615a] transition hover:text-[#2f2d2a]" href="/settings">
-              Settings
+            <Link className="italic text-[#66615a] transition hover:text-[#2f2d2a]" href="/">
+              Notebook
             </Link>
           </nav>
           <button className="relative rounded-full p-2 text-[#66615a] transition hover:bg-[#ece8df] hover:text-[#2f2d2a]">

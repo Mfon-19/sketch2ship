@@ -1,4 +1,4 @@
-import { RoadmapPageContent } from "@/components/roadmap/RoadmapPageContent";
+import { redirect } from "next/navigation";
 
 export default async function RoadmapPage({
   params,
@@ -6,5 +6,5 @@ export default async function RoadmapPage({
   params: Promise<{ id: string }>;
 }) {
   const { id } = await params;
-  return <RoadmapPageContent projectId={id} />;
+  redirect(`/projects/${id}/spec?view=plan`);
 }

@@ -10,9 +10,13 @@ import {
   Search,
   Share2,
 } from "lucide-react";
+import { useEffect, useMemo, useState } from "react";
+import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { SourceNotesPanel } from "@/components/spec/SourceNotesPanel";
 import { LiveSpecPanel } from "@/components/spec/LiveSpecPanel";
+import { ExecutionPlanPanel } from "@/components/spec/ExecutionPlanPanel";
 import { useWorkspace } from "@/components/providers/WorkspaceProvider";
+import { cn } from "@/lib/utils";
 
 interface SpecPageContentProps {
   projectId: string;
@@ -21,6 +25,27 @@ interface SpecPageContentProps {
 export function SpecPageContent({ projectId }: SpecPageContentProps) {
   const { workspace, isLoading } = useWorkspace();
   const project = workspace?.projects.find((p) => p.id === projectId);
+  const searchParams = useSearchParams();
+  const router = useRouter();
+  const pathname = usePathname();
+  const initialView = useMemo<"spec" | "plan">(
+    () => (searchParams.get("view") === "plan" ? "plan" : "spec"),
+    [searchParams]
+  );
+  const [view, setView] = useState<"spec" | "plan">(initialView);
+
+  useEffect(() => {
+    setView(initialView);
+  }, [initialView]);
+
+  const setMode = (next: "spec" | "plan") => {
+    setView(next);
+    const params = new URLSearchParams(searchParams.toString());
+    if (next === "plan") params.set("view", "plan");
+    else params.delete("view");
+    const query = params.toString();
+    router.replace(query ? `${pathname}?${query}` : pathname);
+  };
 
   if (isLoading) {
     return (
@@ -55,8 +80,8 @@ export function SpecPageContent({ projectId }: SpecPageContentProps) {
             <Link className="border-b border-white/40 pb-0.5 text-white" href="/projects">
               Projects
             </Link>
-            <Link className="text-white/70 transition hover:text-white" href="/mission-control">
-              Tasks
+            <Link className="text-white/70 transition hover:text-white" href="/">
+              Notebook
             </Link>
           </nav>
         </div>
@@ -87,12 +112,14 @@ export function SpecPageContent({ projectId }: SpecPageContentProps) {
             <ChevronRight className="mx-1 h-4 w-4 opacity-50" />
             <Link
               className="transition hover:text-[#2f2d2a]"
-              href={`/projects/${projectId}/roadmap`}
+              href={`/projects/${projectId}/spec?view=plan`}
             >
               {project.name}
             </Link>
             <ChevronRight className="mx-1 h-4 w-4 opacity-50" />
-            <span className="font-semibold text-[#2f2d2a]">Live Spec</span>
+            <span className="font-semibold text-[#2f2d2a]">
+              {view === "spec" ? "Live Spec" : "Ship Plan"}
+            </span>
           </nav>
           <span className="h-4 w-px bg-[#d1cbc0]" />
           <span className="inline-flex items-center gap-1.5 rounded-md border border-emerald-100 bg-emerald-50 px-2 py-0.5 text-xs font-medium text-emerald-700">
@@ -102,6 +129,32 @@ export function SpecPageContent({ projectId }: SpecPageContentProps) {
         </div>
 
         <div className="flex items-center gap-2">
+          <div className="flex rounded-md bg-[#f2eee6] p-1">
+            <button
+              type="button"
+              onClick={() => setMode("spec")}
+              className={cn(
+                "rounded px-3 py-1 text-xs font-medium transition",
+                view === "spec"
+                  ? "border border-[#ddd7ca] bg-white text-[#2f2d2a]"
+                  : "text-[#736f67] hover:text-[#2f2d2a]"
+              )}
+            >
+              Live Spec
+            </button>
+            <button
+              type="button"
+              onClick={() => setMode("plan")}
+              className={cn(
+                "rounded px-3 py-1 text-xs font-medium transition",
+                view === "plan"
+                  ? "border border-[#ddd7ca] bg-white text-[#2f2d2a]"
+                  : "text-[#736f67] hover:text-[#2f2d2a]"
+              )}
+            >
+              Ship Plan
+            </button>
+          </div>
           <span className="hidden text-xs italic text-[#7b766e] sm:block">
             Last synced 2m ago
           </span>
@@ -120,14 +173,20 @@ export function SpecPageContent({ projectId }: SpecPageContentProps) {
         </div>
       </div>
 
-      <main className="flex min-h-0 flex-1 flex-col overflow-hidden lg:flex-row">
-        <div className="h-1/2 min-h-[22rem] w-full shrink-0 lg:h-auto lg:w-[45%]">
-          <SourceNotesPanel sourceNote={project.sourceNote} />
-        </div>
-        <div className="min-h-0 flex-1">
-          <LiveSpecPanel specSections={project.specSections} />
-        </div>
-      </main>
+      {view === "spec" ? (
+        <main className="flex min-h-0 flex-1 flex-col overflow-hidden lg:flex-row">
+          <div className="h-1/2 min-h-[22rem] w-full shrink-0 lg:h-auto lg:w-[45%]">
+            <SourceNotesPanel sourceNote={project.sourceNote} />
+          </div>
+          <div className="min-h-0 flex-1">
+            <LiveSpecPanel specSections={project.specSections} />
+          </div>
+        </main>
+      ) : (
+        <main className="min-h-0 flex-1 overflow-hidden">
+          <ExecutionPlanPanel project={project} />
+        </main>
+      )}
     </div>
   );
 }

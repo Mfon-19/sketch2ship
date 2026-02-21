@@ -14,9 +14,13 @@ import { cn } from "@/lib/utils";
 
 interface GitHubSyncSidebarProps {
   project: Project;
+  className?: string;
 }
 
-export function GitHubSyncSidebar({ project }: GitHubSyncSidebarProps) {
+export function GitHubSyncSidebar({
+  project,
+  className,
+}: GitHubSyncSidebarProps) {
   const [selectedIssues, setSelectedIssues] = useState<Set<string>>(
     () =>
       new Set(
@@ -45,7 +49,12 @@ export function GitHubSyncSidebar({ project }: GitHubSyncSidebarProps) {
   );
 
   return (
-    <aside className="hidden h-full w-[380px] shrink-0 flex-col border-l border-[#d8d3ca] bg-white xl:flex 2xl:w-[410px]">
+    <aside
+      className={cn(
+        "hidden h-full w-[380px] shrink-0 flex-col border-l border-[#d8d3ca] bg-white xl:flex 2xl:w-[410px]",
+        className
+      )}
+    >
       <div className="border-b border-[#d8d3ca] bg-[#f2eee6]/60 p-6">
         <div className="mb-4 flex items-center justify-between">
           <div className="flex items-center gap-2">

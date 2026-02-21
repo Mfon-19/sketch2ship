@@ -1,4 +1,9 @@
-import { failRun, finalizeRun, getNoteById, updateRunStatus } from "@/lib/server/workspace-db";
+import {
+  failRun,
+  finalizeRun,
+  getAreaTextForRun,
+  updateRunStatus,
+} from "@/lib/server/workspace-db";
 import { refineNotebook, toProject } from "@/lib/server/refine-engine";
 
 const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -13,14 +18,18 @@ async function processRun(workspaceId: string, runId: string) {
     if (!threading) return;
     await delay(350);
 
-    const note = await getNoteById(workspaceId, threading.noteId);
-    if (!note) {
-      await failRun(workspaceId, runId, "Source note not found");
+    const areaPayload = await getAreaTextForRun(workspaceId, runId);
+    if (!areaPayload) {
+      await failRun(workspaceId, runId, "Source area not found");
+      return;
+    }
+    if (!areaPayload.text.trim()) {
+      await failRun(workspaceId, runId, "Area contains no text to refine");
       return;
     }
 
     await updateRunStatus(workspaceId, runId, "specing");
-    const refined = await refineNotebook(note.content);
+    const refined = await refineNotebook(areaPayload.text);
     await delay(300);
 
     await updateRunStatus(workspaceId, runId, "planning");

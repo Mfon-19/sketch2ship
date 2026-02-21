@@ -2,14 +2,12 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { Home, FolderOpen, Send, Settings } from "lucide-react";
+import { Home, FolderOpen } from "lucide-react";
 import { cn } from "@/lib/utils";
 
 const navItems = [
   { href: "/", label: "Overview", icon: Home },
   { href: "/projects", label: "Projects", icon: FolderOpen },
-  { href: "/mission-control", label: "Shipments", icon: Send },
-  { href: "/settings", label: "Settings", icon: Settings },
 ];
 
 export function MobileNav() {
@@ -21,8 +19,7 @@ export function MobileNav() {
         const Icon = item.icon;
         const isActive =
           pathname === item.href ||
-          (item.href.includes("/projects") && pathname.startsWith("/projects")) ||
-          (item.href === "/mission-control" && pathname.startsWith("/mission-control"));
+          (item.href.includes("/projects") && pathname.startsWith("/projects"));
         return (
           <Link
             key={item.href}

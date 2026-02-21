@@ -3,30 +3,28 @@ import {
   attachGuestWorkspaceCookie,
   resolveGuestWorkspaceId,
 } from "@/lib/server/guest-cookie";
-import { saveNoteContent } from "@/lib/server/workspace-db";
+import { saveNotePatches } from "@/lib/server/workspace-db";
+import type { NotePatch } from "@/lib/notebook-types";
 
 export async function POST(request: NextRequest) {
   const { workspaceId, isNew } = resolveGuestWorkspaceId(request);
 
   const body = (await request.json()) as {
-    content?: string;
+    patches?: NotePatch[];
     noteId?: string;
   };
-
-  const content = body.content?.trim() ?? "";
-  if (!content) {
-    return NextResponse.json(
-      { error: "content is required" },
-      { status: 400 }
-    );
+  const patches = Array.isArray(body.patches) ? body.patches : [];
+  if (patches.length === 0) {
+    return NextResponse.json({ error: "patches are required" }, { status: 400 });
   }
 
-  const result = await saveNoteContent(workspaceId, content, body.noteId);
+  const result = await saveNotePatches(workspaceId, patches, body.noteId);
 
   const response = NextResponse.json({
     workspaceId,
     note: result.note,
     workspace: result.workspace,
+    areaSummaries: result.areaSummaries,
   });
   attachGuestWorkspaceCookie(response, workspaceId, isNew);
   return response;
