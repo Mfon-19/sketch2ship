@@ -63,6 +63,9 @@ export function SpecPageContent({ projectId }: SpecPageContentProps) {
     );
   }
 
+  const ideaSummary =
+    project.ideaSummary?.trim() || project.sourceNote?.aiNote?.trim() || "";
+
   return (
     <div className="flex h-screen min-h-screen flex-col overflow-hidden bg-[#fdfbf7]">
       <header className="flex h-16 items-center justify-between border-b border-black/20 bg-[#171717] px-6 text-white">
@@ -179,7 +182,10 @@ export function SpecPageContent({ projectId }: SpecPageContentProps) {
             <SourceNotesPanel sourceNote={project.sourceNote} />
           </div>
           <div className="min-h-0 flex-1">
-            <LiveSpecPanel specSections={project.specSections} />
+            <LiveSpecPanel
+              specSections={project.specSections}
+              ideaSummary={ideaSummary}
+            />
           </div>
         </main>
       ) : (

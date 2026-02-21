@@ -9,9 +9,10 @@ import { cn } from "@/lib/utils";
 
 interface LiveSpecPanelProps {
   specSections: SpecSectionType[];
+  ideaSummary?: string;
 }
 
-export function LiveSpecPanel({ specSections }: LiveSpecPanelProps) {
+export function LiveSpecPanel({ specSections, ideaSummary }: LiveSpecPanelProps) {
   const [view, setView] = useState<"list" | "graph">("list");
 
   return (
@@ -61,6 +62,14 @@ export function LiveSpecPanel({ specSections }: LiveSpecPanelProps) {
 
       <ScrollArea className="min-h-0 flex-1 bg-[#fbfaf7]">
         <div className="p-8">
+          {ideaSummary ? (
+            <div className="mb-6 rounded-xl border border-[#e4ddcf] bg-white p-4">
+              <div className="mb-1.5 text-[11px] font-semibold uppercase tracking-[0.16em] text-[#6f695f]">
+                AI Idea Summary
+              </div>
+              <p className="text-sm leading-6 text-[#2f2d2a]">{ideaSummary}</p>
+            </div>
+          ) : null}
           {view === "list" ? (
             <div className="space-y-8">
               {specSections.map((section) => (

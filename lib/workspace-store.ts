@@ -70,6 +70,7 @@ export interface SourceNote {
 export interface Project {
   id: string;
   name: string;
+  ideaSummary?: string;
   noteId?: string;
   areaId?: string;
   specSections: SpecSection[];

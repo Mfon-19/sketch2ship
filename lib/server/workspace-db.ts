@@ -1,4 +1,4 @@
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { ExtractedIdea } from "@/lib/mock-data";
 import type {
@@ -32,9 +32,10 @@ interface DatabaseFile {
 
 const STORAGE_DIR = path.join(process.cwd(), ".data");
 const STORAGE_FILE = path.join(STORAGE_DIR, "guest-workspaces.json");
+const STORAGE_LOCK_DIR = path.join(STORAGE_DIR, "guest-workspaces.lock");
+const LOCK_STALE_MS = 30_000;
 const CLUSTER_DISTANCE = 1000;
 
-let cache: DatabaseFile | null = null;
 let lock: Promise<void> = Promise.resolve();
 
 function nowIso() {
@@ -75,22 +76,59 @@ function cloneWorkspaceRecord(record: WorkspaceRecord): WorkspaceRecord {
 }
 
 async function loadDb(): Promise<DatabaseFile> {
-  if (cache) return cache;
-
   try {
     const raw = await readFile(STORAGE_FILE, "utf8");
-    cache = JSON.parse(raw) as DatabaseFile;
-    return cache;
+    return JSON.parse(raw) as DatabaseFile;
   } catch {
-    cache = { workspaces: {} };
-    return cache;
+    return { workspaces: {} };
   }
 }
 
 async function saveDb(db: DatabaseFile) {
   await mkdir(STORAGE_DIR, { recursive: true });
   await writeFile(STORAGE_FILE, JSON.stringify(db, null, 2), "utf8");
-  cache = db;
+}
+
+function sleep(ms: number) {
+  return new Promise<void>((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
+
+async function acquireFileLock() {
+  await mkdir(STORAGE_DIR, { recursive: true });
+  const started = Date.now();
+
+  while (true) {
+    try {
+      await mkdir(STORAGE_LOCK_DIR);
+      return;
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code !== "EEXIST") {
+        throw error;
+      }
+
+      try {
+        const lockStat = await stat(STORAGE_LOCK_DIR);
+        if (Date.now() - lockStat.mtimeMs > LOCK_STALE_MS) {
+          await rm(STORAGE_LOCK_DIR, { recursive: true, force: true });
+          continue;
+        }
+      } catch {
+        // Lock was released before stat/rm; retry acquisition.
+      }
+
+      if (Date.now() - started > LOCK_STALE_MS * 2) {
+        throw new Error("workspace-file-lock-timeout");
+      }
+      await sleep(20);
+    }
+  }
+}
+
+async function releaseFileLock() {
+  await rm(STORAGE_LOCK_DIR, { recursive: true, force: true });
 }
 
 async function withLock<T>(fn: () => Promise<T>): Promise<T> {
@@ -101,8 +139,10 @@ async function withLock<T>(fn: () => Promise<T>): Promise<T> {
   });
   await previous;
   try {
+    await acquireFileLock();
     return await fn();
   } finally {
+    await releaseFileLock();
     release();
   }
 }

@@ -127,10 +127,15 @@ export function NotebookPageContent() {
   const [bootstrapped, setBootstrapped] = useState(false);
 
   const canvasRef = useRef<HTMLDivElement | null>(null);
+  const blocksRef = useRef<NotebookBlock[]>([]);
   const pendingPatchesRef = useRef<NotePatch[]>([]);
   const flushTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const idleQueueTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const runQueueTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const lastQueuedAreaRef = useRef<Record<string, string>>({});
+  const saveInFlightRef = useRef(false);
+  const noteIdRef = useRef<string | null>(null);
+  const localDirtyRef = useRef(false);
 
   const interactionRef = useRef<
     | { type: "none" }
@@ -179,19 +184,27 @@ export function NotebookPageContent() {
 
     const payload = (await response.json()) as WorkspaceLatestResponse;
     syncWorkspace(payload.workspace);
-    setAreaSummaries(payload.areaSummaries ?? []);
+    const latestAreas = payload.areaSummaries ?? [];
+    setAreaSummaries(latestAreas);
+    for (const area of latestAreas) {
+      if (!area.preview.trim() || area.status !== "ready") continue;
+      lastQueuedAreaRef.current[area.id] = `${area.preview}:${area.blockIds.join(",")}`;
+    }
 
     const firstNote =
       payload.workspace.notebooks.find((note) => note.id === payload.latestNoteId) ??
       payload.workspace.notebooks[0];
     if (firstNote) {
       setNoteId(firstNote.id);
-      setViewport(firstNote.canvas.viewport ?? createDefaultViewport());
-      setBlocks((previous) =>
-        previous.length
-          ? mergeServerAreaIds(previous, firstNote.canvas.blocks)
-          : firstNote.canvas.blocks
-      );
+      // Avoid clobbering unsaved local edits during active typing/dragging.
+      if (!localDirtyRef.current && !flushTimerRef.current && !saveInFlightRef.current) {
+        setViewport(firstNote.canvas.viewport ?? createDefaultViewport());
+        setBlocks((previous) =>
+          previous.length
+            ? mergeServerAreaIds(previous, firstNote.canvas.blocks)
+            : firstNote.canvas.blocks
+        );
+      }
     }
 
     return payload;
@@ -209,61 +222,175 @@ export function NotebookPageContent() {
     })();
   }, [bootstrapped, isLoading, refreshLatest]);
 
-  const queuePatch = useCallback((patch: NotePatch) => {
-    pendingPatchesRef.current.push(patch);
-    if (flushTimerRef.current) return;
+  useEffect(() => {
+    noteIdRef.current = noteId;
+  }, [noteId]);
 
-    flushTimerRef.current = setTimeout(async () => {
-      flushTimerRef.current = null;
-      const raw = pendingPatchesRef.current;
-      if (raw.length === 0) return;
-      pendingPatchesRef.current = [];
-      const patches = compactPatches(raw);
+  useEffect(() => {
+    blocksRef.current = blocks;
+  }, [blocks]);
 
-      setSaveState("saving");
+  const queueRuns = useCallback(async (currentNoteId: string, areas: AreaSummary[]) => {
+    if (!currentNoteId || areas.length === 0) return;
+
+    for (const area of areas) {
+      if (!area.preview.trim()) continue;
+      const fingerprint = `${area.preview}:${area.blockIds.join(",")}`;
+      if (
+        area.status !== "failed" &&
+        lastQueuedAreaRef.current[area.id] === fingerprint
+      ) {
+        continue;
+      }
+
       try {
-        const response = await fetch("/api/workspace/note", {
+        const response = await fetch("/api/runs", {
           method: "POST",
           credentials: "include",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
-            noteId: noteId ?? undefined,
-            patches,
+            noteId: currentNoteId,
+            areaId: area.id,
           }),
         });
-
-        if (!response.ok) {
-          setSaveState("error");
-          return;
-        }
-
-        const payload = (await response.json()) as {
-          note: {
-            id: string;
-            canvas: {
-              viewport: NotebookViewport;
-              blocks: NotebookBlock[];
-            };
-          };
-          workspace: Workspace;
-          areaSummaries: AreaSummary[];
-        };
-
-        setNoteId(payload.note.id);
-        setAreaSummaries(payload.areaSummaries ?? []);
-        setViewport(payload.note.canvas.viewport);
-        setBlocks((previous) =>
-          previous.length
-            ? mergeServerAreaIds(previous, payload.note.canvas.blocks)
-            : payload.note.canvas.blocks
-        );
-        syncWorkspace(payload.workspace);
-        setSaveState("saved");
+        if (!response.ok) continue;
+        lastQueuedAreaRef.current[area.id] = fingerprint;
       } catch {
-        setSaveState("error");
+        // ignore transient queue failures
       }
+    }
+
+    await refreshLatest();
+  }, [refreshLatest]);
+
+  const scheduleRunQueue = useCallback(
+    (currentNoteId: string, areas: AreaSummary[]) => {
+      if (runQueueTimerRef.current) clearTimeout(runQueueTimerRef.current);
+      runQueueTimerRef.current = setTimeout(() => {
+        void queueRuns(currentNoteId, areas);
+      }, 1200);
+    },
+    [queueRuns]
+  );
+
+  const flushQueuedPatches = useCallback(async () => {
+    if (saveInFlightRef.current) return;
+    const raw = pendingPatchesRef.current;
+    if (raw.length === 0) return;
+    pendingPatchesRef.current = [];
+    const touchedBlockIds = new Set<string>();
+    const priorTouchedAreaIds = new Set<string>();
+    for (const patch of raw) {
+      if (patch.op === "upsert_block") {
+        touchedBlockIds.add(patch.block.id);
+        if (patch.block.areaId) priorTouchedAreaIds.add(patch.block.areaId);
+        continue;
+      }
+      if (patch.op === "delete_block") {
+        touchedBlockIds.add(patch.blockId);
+        continue;
+      }
+      if (patch.op === "replace_blocks" || patch.op === "set_canvas") {
+        for (const block of blocksRef.current) {
+          touchedBlockIds.add(block.id);
+          if (block.areaId) priorTouchedAreaIds.add(block.areaId);
+        }
+      }
+    }
+    for (const blockId of touchedBlockIds) {
+      const existing = blocksRef.current.find((block) => block.id === blockId);
+      if (existing?.areaId) {
+        priorTouchedAreaIds.add(existing.areaId);
+      }
+    }
+    const patches = compactPatches(raw);
+
+    saveInFlightRef.current = true;
+    setSaveState("saving");
+    let committedNoteId: string | null = null;
+    let committedAreas: AreaSummary[] = [];
+
+    try {
+      const response = await fetch("/api/workspace/note", {
+        method: "POST",
+        credentials: "include",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          noteId: noteIdRef.current ?? undefined,
+          patches,
+        }),
+      });
+
+      if (!response.ok) {
+        setSaveState("error");
+        return;
+      }
+
+      const payload = (await response.json()) as {
+        note: {
+          id: string;
+          canvas: {
+            viewport: NotebookViewport;
+            blocks: NotebookBlock[];
+          };
+        };
+        workspace: Workspace;
+        areaSummaries: AreaSummary[];
+      };
+
+      committedNoteId = payload.note.id;
+      const savedAreas = payload.areaSummaries ?? [];
+      const affected = new Map<string, AreaSummary>();
+      for (const area of savedAreas) {
+        if (area.blockIds.some((blockId) => touchedBlockIds.has(blockId))) {
+          affected.set(area.id, area);
+        }
+      }
+      for (const area of savedAreas) {
+        if (priorTouchedAreaIds.has(area.id)) {
+          affected.set(area.id, area);
+        }
+      }
+      committedAreas = [...affected.values()];
+      noteIdRef.current = payload.note.id;
+      setNoteId(payload.note.id);
+      setAreaSummaries(savedAreas);
+      setViewport(payload.note.canvas.viewport);
+      setBlocks((previous) =>
+        previous.length
+          ? mergeServerAreaIds(previous, payload.note.canvas.blocks)
+          : payload.note.canvas.blocks
+      );
+      syncWorkspace(payload.workspace);
+    } catch {
+      setSaveState("error");
+      return;
+    } finally {
+      saveInFlightRef.current = false;
+    }
+
+    if (pendingPatchesRef.current.length > 0) {
+      void flushQueuedPatches();
+      return;
+    }
+
+    localDirtyRef.current = false;
+    setSaveState("saved");
+    if (committedNoteId) {
+      scheduleRunQueue(committedNoteId, committedAreas);
+    }
+  }, [scheduleRunQueue, syncWorkspace]);
+
+  const queuePatch = useCallback((patch: NotePatch) => {
+    localDirtyRef.current = true;
+    pendingPatchesRef.current.push(patch);
+    if (flushTimerRef.current) return;
+
+    flushTimerRef.current = setTimeout(() => {
+      flushTimerRef.current = null;
+      void flushQueuedPatches();
     }, 550);
-  }, [noteId, syncWorkspace]);
+  }, [flushQueuedPatches]);
 
   const toWorldPoint = useCallback(
     (clientX: number, clientY: number) => {
@@ -303,44 +430,16 @@ export function NotebookPageContent() {
 
   const queueRunsForAreas = useCallback(async () => {
     const currentNoteId = noteId;
-    if (!currentNoteId || areaSummaries.length === 0) return;
-
-    for (const area of areaSummaries) {
-      if (!area.preview.trim()) continue;
-      const fingerprint = `${area.preview}:${area.blockIds.join(",")}`;
-      if (
-        area.status === "ready" &&
-        lastQueuedAreaRef.current[area.id] === fingerprint
-      ) {
-        continue;
-      }
-
-      try {
-        const response = await fetch("/api/runs", {
-          method: "POST",
-          credentials: "include",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            noteId: currentNoteId,
-            areaId: area.id,
-          }),
-        });
-        if (!response.ok) continue;
-        lastQueuedAreaRef.current[area.id] = fingerprint;
-      } catch {
-        // ignore transient queue failures
-      }
-    }
-
-    await refreshLatest();
-  }, [areaSummaries, noteId, refreshLatest]);
+    if (!currentNoteId) return;
+    await queueRuns(currentNoteId, areaSummaries);
+  }, [areaSummaries, noteId, queueRuns]);
 
   useEffect(() => {
     if (!bootstrapped) return;
     if (idleQueueTimerRef.current) clearTimeout(idleQueueTimerRef.current);
     idleQueueTimerRef.current = setTimeout(() => {
       void queueRunsForAreas();
-    }, 45_000);
+    }, 12_000);
 
     return () => {
       if (idleQueueTimerRef.current) {
@@ -358,6 +457,15 @@ export function NotebookPageContent() {
     window.addEventListener("blur", onBlur);
     return () => window.removeEventListener("blur", onBlur);
   }, [queueRunsForAreas]);
+
+  useEffect(() => {
+    return () => {
+      if (runQueueTimerRef.current) {
+        clearTimeout(runQueueTimerRef.current);
+        runQueueTimerRef.current = null;
+      }
+    };
+  }, []);
 
   const hasActiveAreas = areaSummaries.some((area) =>
     ACTIVE_STATUSES.includes(area.status as RunStatus)

@@ -11,6 +11,7 @@ export interface RefineResponse {
   ideas: ExtractedIdea[];
   project: {
     name: string;
+    ideaSummary?: string;
     sourceNote: SourceNote;
     specSections: SpecSection[];
     milestones: Milestone[];
@@ -34,6 +35,7 @@ Output a single JSON object with this exact structure (no markdown, no code fenc
   ],
   "project": {
     "name": "string (project name)",
+    "ideaSummary": "string (1-2 sentences, concise summary of what this app is, who it serves, and MVP outcome)",
     "sourceNote": {
       "title": "string",
       "date": "string (ISO date or readable)",
@@ -122,6 +124,8 @@ function fallbackRefine(content: string): RefineResponse {
     ],
     project: {
       name: projectName,
+      ideaSummary:
+        "A notebook-first workspace that turns raw idea fragments into a clear MVP spec, milestones, and ready-to-ship tasks.",
       sourceNote: {
         title: "Notebook Capture",
         date: new Date().toLocaleDateString("en-US", {
@@ -287,6 +291,12 @@ export async function refineNotebook(content: string): Promise<RefineResponse> {
   if (!parsed.project.specSections) parsed.project.specSections = [];
   if (!parsed.project.milestones) parsed.project.milestones = [];
   if (!parsed.project.generatedIssues) parsed.project.generatedIssues = [];
+  if (!parsed.project.ideaSummary || !parsed.project.ideaSummary.trim()) {
+    const highlights = parsed.project.sourceNote?.highlights ?? [];
+    parsed.project.ideaSummary =
+      highlights.find((text) => text.trim())?.slice(0, 220) ??
+      "AI summary unavailable for this project.";
+  }
   if (!parsed.project.sourceNote) {
     parsed.project.sourceNote = {
       title: "Refined from notes",
@@ -303,6 +313,7 @@ export function toProject(result: RefineResponse): Project {
   return {
     id: crypto.randomUUID(),
     name: result.project.name,
+    ideaSummary: result.project.ideaSummary,
     sourceNote: result.project.sourceNote,
     specSections: result.project.specSections,
     milestones: result.project.milestones,
