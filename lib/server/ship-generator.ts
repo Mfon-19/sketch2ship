@@ -157,7 +157,7 @@ export async function generateShipArtifacts(
 
     const ai = new GoogleGenAI({ apiKey });
     const response = await ai.models.generateContent({
-      model: "gemini-3.1-pro-preview",
+      model: "gemini-3-flash-preview",
       contents: `${SHIP_PROMPT}\n\n---\n\nProject context:\n${contextJson}`,
       config: {
         responseMimeType: "application/json",
