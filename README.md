@@ -56,7 +56,3 @@ lib/
     ship-processor.ts    # Repo create, branch, commit, PR
     github-client.ts     # GitHub API wrapper
 ```
-
-## License
-
-MIT
